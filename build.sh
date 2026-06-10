@@ -13,11 +13,13 @@ VERSION="${VERSION:-}"
 COMMIT="${COMMIT:-}"
 DATE="${DATE:-}"
 PUSH_AFTER_BUILD="false"
+SOURCE_IMAGE="${SOURCE_IMAGE:-}"
+MIN_RUN_SIZE_BYTES="${MIN_RUN_SIZE_BYTES:-5242880}"
 
 usage() {
   cat <<USAGE
 Usage:
-  bash build.sh --arch amd64|arm64|all [--version <version>] [--push]
+  bash build.sh --arch amd64|arm64|all [--version <version>] [--source-image <multiarch-ref>] [--push]
 
 Build offline .run delivery packages for sbgw.
 
@@ -25,6 +27,7 @@ Examples:
   bash build.sh --arch amd64
   bash build.sh --arch arm64
   bash build.sh --arch all --version v0.1.0
+  bash build.sh --arch amd64 --version v0.1.0 --source-image registry.cn-beijing.aliyuncs.com/ainfracn/sbgw:v0.1.0
 USAGE
 }
 
@@ -36,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="${2:-}"; shift 2 ;;
     --version) VERSION="${2:-}"; shift 2 ;;
+    --source-image) SOURCE_IMAGE="${2:-}"; shift 2 ;;
     --push) PUSH_AFTER_BUILD="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
@@ -125,7 +129,13 @@ build_one_arch() {
     [[ -n "${tar_name}" ]] || die "image.tar is required for ${name}/${arch}"
 
     log "Preparing image ${name} arch=${arch} platform=${platform} tag=${tag}"
-    if [[ -n "${dockerfile}" ]]; then
+    if [[ -n "${SOURCE_IMAGE}" ]]; then
+      log "Pulling published image for offline payload: ${SOURCE_IMAGE} platform=${platform}"
+      docker pull --platform "${platform}" "${SOURCE_IMAGE}"
+      docker tag "${SOURCE_IMAGE}" "${tag}"
+      pull="${SOURCE_IMAGE}"
+      dockerfile=""
+    elif [[ -n "${dockerfile}" ]]; then
       docker buildx build \
         --platform "${platform}" \
         --load \
@@ -145,6 +155,14 @@ build_one_arch() {
     fi
 
     docker save "${tag}" -o "${payload_dir}/images/${tar_name}"
+    if [[ ! -s "${payload_dir}/images/${tar_name}" ]]; then
+      die "docker save produced empty tar: ${tar_name}"
+    fi
+    tar_size="$(wc -c < "${payload_dir}/images/${tar_name}" | tr -d ' ')"
+    if (( tar_size < 1048576 )); then
+      die "image tar ${tar_name} is too small (${tar_size} bytes); offline payload likely missed the image"
+    fi
+    log "Saved image tar ${tar_name} size=${tar_size} bytes"
     printf '%s|%s|%s|%s|%s|%s|%s\n' "${name}" "${tar_name}" "${tag}" "${tag}" "${platform}" "${pull}" "${dockerfile}" >> "${payload_dir}/images/image-index.tsv"
   done
 
@@ -154,6 +172,10 @@ build_one_arch() {
 
   cat "${INSTALL_SH}" "${payload_tgz}" > "${run_file}"
   chmod +x "${run_file}"
+  run_size="$(wc -c < "${run_file}" | tr -d ' ')"
+  if (( run_size < MIN_RUN_SIZE_BYTES )); then
+    die ".run package is too small (${run_size} bytes); expected image tar payload to be embedded"
+  fi
   sha256sum "${run_file}" > "${run_file}.sha256"
   ok "Built ${run_file}"
 }

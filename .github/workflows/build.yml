@@ -29,6 +29,12 @@ jobs:
     name: Build and publish multi-arch images
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      version_tag: ${{ steps.meta.outputs.version_tag }}
+      aliyun_image: ${{ steps.meta.outputs.aliyun_image }}
+      dockerhub_image: ${{ steps.meta.outputs.dockerhub_image }}
+      run_source_image: ${{ steps.meta.outputs.run_source_image }}
+      pushed: ${{ steps.meta.outputs.push }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -66,13 +72,24 @@ jobs:
           fi
 
           tags=()
+          aliyun_image=""
+          dockerhub_image=""
+          run_source_image=""
+
           if [[ "${{ vars.PUBLISH_ALIYUN }}" == "true" ]]; then
-            base="${{ vars.ALIYUN_REGISTRY }}/${{ vars.ALIYUN_NAMESPACE }}/${IMAGE_NAME}"
-            tags+=("${base}:${VERSION_TAG}" "${base}:${EXTRA_TAG}")
+            aliyun_image="${{ vars.ALIYUN_REGISTRY }}/${{ vars.ALIYUN_NAMESPACE }}/${IMAGE_NAME}:${VERSION_TAG}"
+            aliyun_base="${{ vars.ALIYUN_REGISTRY }}/${{ vars.ALIYUN_NAMESPACE }}/${IMAGE_NAME}"
+            tags+=("${aliyun_base}:${VERSION_TAG}" "${aliyun_base}:${EXTRA_TAG}")
+            run_source_image="${aliyun_image}"
           fi
+
           if [[ "${{ vars.PUBLISH_DOCKERHUB }}" == "true" ]]; then
-            base="${{ vars.DOCKERHUB_NAMESPACE }}/${IMAGE_NAME}"
-            tags+=("${base}:${VERSION_TAG}" "${base}:${EXTRA_TAG}")
+            dockerhub_image="${{ vars.DOCKERHUB_NAMESPACE }}/${IMAGE_NAME}:${VERSION_TAG}"
+            dockerhub_base="${{ vars.DOCKERHUB_NAMESPACE }}/${IMAGE_NAME}"
+            tags+=("${dockerhub_base}:${VERSION_TAG}" "${dockerhub_base}:${EXTRA_TAG}")
+            if [[ -z "${run_source_image}" ]]; then
+              run_source_image="${dockerhub_image}"
+            fi
           fi
 
           if [[ ${#tags[@]} -eq 0 ]]; then
@@ -86,23 +103,28 @@ jobs:
             echo 'tags<<EOF'
             printf '%s\n' "${tags[@]}"
             echo 'EOF'
+            echo "version_tag=${VERSION_TAG}"
+            echo "aliyun_image=${aliyun_image}"
+            echo "dockerhub_image=${dockerhub_image}"
+            echo "run_source_image=${run_source_image}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build multi-arch image
+      - name: Build and publish multi-arch image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ steps.meta.outputs.push == 'true' }}
+          load: ${{ steps.meta.outputs.push != 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ steps.meta.outputs.version_tag }}
             COMMIT=${{ github.sha }}
             DATE=${{ github.event.head_commit.timestamp }}
 
   run-packages:
     name: Build offline run package (${{ matrix.arch }})
-    needs: test
+    needs: [ test, docker-multiarch ]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -112,18 +134,53 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - name: Build .run package
+
+      - name: Login to Aliyun Registry for pulling release image
+        if: ${{ vars.PUBLISH_ALIYUN == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Login to Docker Hub for pulling release image
+        if: ${{ vars.PUBLISH_DOCKERHUB == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build .run package from published image
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            export VERSION="${GITHUB_REF_NAME}"
-          else
-            export VERSION="sha-${GITHUB_SHA::7}"
-          fi
+          VERSION="${{ needs.docker-multiarch.outputs.version_tag }}"
+          SOURCE_IMAGE="${{ needs.docker-multiarch.outputs.run_source_image }}"
           export COMMIT="${GITHUB_SHA::7}"
           export DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          bash build.sh --arch "${{ matrix.arch }}" --version "${VERSION}"
+
+          if [[ -n "${SOURCE_IMAGE}" ]]; then
+            echo "[INFO] Building .run from published multi-arch image: ${SOURCE_IMAGE}"
+            bash build.sh --arch "${{ matrix.arch }}" --version "${VERSION}" --source-image "${SOURCE_IMAGE}"
+          else
+            echo "[WARN] No registry publishing enabled. Falling back to local Dockerfile build for .run."
+            bash build.sh --arch "${{ matrix.arch }}" --version "${VERSION}"
+          fi
+
+          echo "[INFO] Built files:"
+          ls -lh dist/
+          echo "[INFO] Payload image index preview:"
+          tmpdir="$(mktemp -d)"
+          run_file="$(ls dist/*.run | head -n 1)"
+          awk '/^__PAYLOAD_BELOW__$/ { print NR; exit }' "$run_file"
+          # Verify run file is not tiny; a package without image tar is normally only KB-sized.
+          min_size=$((5 * 1024 * 1024))
+          actual_size=$(stat -c '%s' "$run_file")
+          if (( actual_size < min_size )); then
+            echo "[ERROR] .run package is too small (${actual_size} bytes). It probably does not contain image tar payload."
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: sbgw-run-${{ matrix.arch }}
