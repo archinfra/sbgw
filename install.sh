@@ -21,11 +21,16 @@ YES="false"
 APPLY="true"
 DRY_RUN="false"
 REPLICAS="1"
-SERVICE_TYPE="ClusterIP"
-NODE_PORT=""
+SERVICE_TYPE="NodePort"
+NODE_PORT="30088"
 UPSTREAM_BASE_URL="http://vllm:8000"
+UPSTREAM_API_KEY=""
+UPSTREAM_FORWARD_CLIENT_AUTHORIZATION="false"
+UPSTREAM_STRATEGY="weighted_round_robin"
 AUTH_ENABLED="true"
-AUTH_TOKEN="sk-local-dev-001"
+AUTH_TOKEN_SET="false"
+AUTH_TOKENS=("sk-local-dev-001")
+AUTH_KEYS=()
 WAIT_TIMEOUT="120s"
 DELETE_NAMESPACE="false"
 
@@ -58,24 +63,30 @@ Install options:
   -n, --namespace <ns>           Kubernetes namespace. Default: sbgw
   --name <name>                  Kubernetes app name. Default: sbgw
   --replicas <n>                 Deployment replicas. Default: 1
-  --service-type <type>          ClusterIP|NodePort|LoadBalancer. Default: ClusterIP
-  --node-port <port>             NodePort when service-type=NodePort
+  --service-type <type>          ClusterIP|NodePort|LoadBalancer. Default: NodePort
+  --node-port <port>             NodePort when service-type=NodePort. Default: 30088
   --upstream-base-url <url>      Upstream OpenAI-compatible base URL
+  --upstream-api-key <sk>        Upstream API key. Empty means upstream does not need key.
+  --forward-client-authorization true|false
+                                  Forward client Authorization only when upstream-api-key is empty. Default: false
+  --upstream-strategy <strategy> round_robin|weighted_round_robin|random|weighted_random|least_inflight
   --auth-enabled true|false      Enable gateway SK auth. Default: true
-  --auth-token <sk>              Gateway SK token. Default: sk-local-dev-001
+  --auth-token <sk>              Gateway SK token. Can be repeated. First usage replaces default token.
+  --auth-tokens <a,b,c>          Comma separated gateway SK tokens. Replaces default token.
+  --auth-key <name:key[:quota]>  Gateway key with optional token quota. Can be repeated.
   --wait-timeout <duration>      kubectl rollout wait timeout. Default: 120s
   --no-apply                     Render manifest only, do not kubectl apply
   --dry-run                      Print rendered manifest, do not apply
   --delete-namespace             uninstall also deletes namespace
   -y, --yes                      Skip confirmation
 
-Example:
+Examples:
   ./sbgw-v0.1.0-linux-amd64.run install \
     --registry sealos.hub:5000/kube4 \
-    --registry-user admin \
-    --registry-pass passw0rd \
     --upstream-base-url http://qwen-vllm.aict.svc:8000 \
-    --auth-token sk-prod-xxx \
+    --upstream-api-key sk-upstream-xxx \
+    --auth-key user-a:sk-user-a:1000000 \
+    --auth-key user-b:sk-user-b:500000 \
     -n aict -y
 USAGE
 }
@@ -86,6 +97,17 @@ parse_bool() {
     false|FALSE|False|0|no|NO|n|N) printf 'false' ;;
     *) die "Invalid boolean value: $1" ;;
   esac
+}
+
+set_auth_tokens_from_csv() {
+  AUTH_TOKENS=()
+  AUTH_TOKEN_SET="true"
+  local csv="$1" part
+  IFS=',' read -r -a parts <<< "${csv}"
+  for part in "${parts[@]}"; do
+    part="$(printf '%s' "${part}" | sed -e 's/^ *//' -e 's/ *$//')"
+    [[ -n "${part}" ]] && AUTH_TOKENS+=("${part}")
+  done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -100,8 +122,15 @@ while [[ $# -gt 0 ]]; do
     --service-type) SERVICE_TYPE="${2:-}"; shift 2 ;;
     --node-port) NODE_PORT="${2:-}"; shift 2 ;;
     --upstream-base-url) UPSTREAM_BASE_URL="${2:-}"; shift 2 ;;
+    --upstream-api-key) UPSTREAM_API_KEY="${2:-}"; shift 2 ;;
+    --forward-client-authorization) UPSTREAM_FORWARD_CLIENT_AUTHORIZATION="$(parse_bool "${2:-}")"; shift 2 ;;
+    --upstream-strategy) UPSTREAM_STRATEGY="${2:-}"; shift 2 ;;
     --auth-enabled) AUTH_ENABLED="$(parse_bool "${2:-}")"; shift 2 ;;
-    --auth-token) AUTH_TOKEN="${2:-}"; shift 2 ;;
+    --auth-token)
+      if [[ "${AUTH_TOKEN_SET}" != "true" ]]; then AUTH_TOKENS=(); AUTH_TOKEN_SET="true"; fi
+      AUTH_TOKENS+=("${2:-}"); shift 2 ;;
+    --auth-tokens) set_auth_tokens_from_csv "${2:-}"; shift 2 ;;
+    --auth-key) AUTH_KEYS+=("${2:-}"); shift 2 ;;
     --wait-timeout) WAIT_TIMEOUT="${2:-}"; shift 2 ;;
     --no-apply) APPLY="false"; shift ;;
     --dry-run) DRY_RUN="true"; APPLY="false"; shift ;;
@@ -111,6 +140,15 @@ while [[ $# -gt 0 ]]; do
     *) die "Unknown argument: $1" ;;
   esac
 done
+
+case "${SERVICE_TYPE}" in
+  ClusterIP|NodePort|LoadBalancer) ;;
+  *) die "--service-type must be ClusterIP, NodePort or LoadBalancer" ;;
+esac
+case "${UPSTREAM_STRATEGY}" in
+  round_robin|weighted_round_robin|random|weighted_random|least_inflight) ;;
+  *) die "Unsupported --upstream-strategy: ${UPSTREAM_STRATEGY}" ;;
+esac
 
 cleanup() { rm -rf "${WORKDIR}"; }
 trap cleanup EXIT
@@ -147,8 +185,13 @@ Action: ${ACTION}
 Namespace: ${NAMESPACE}
 Name: ${INSTALL_NAME}
 Registry: ${REGISTRY}
+Service: ${SERVICE_TYPE}${NODE_PORT:+/${NODE_PORT}}
 Upstream: ${UPSTREAM_BASE_URL}
+Upstream API key: $( [[ -n "${UPSTREAM_API_KEY}" ]] && printf '<set>' || printf '<empty>' )
+Upstream strategy: ${UPSTREAM_STRATEGY}
 Auth enabled: ${AUTH_ENABLED}
+Gateway tokens: ${#AUTH_TOKENS[@]}
+Gateway quota keys: ${#AUTH_KEYS[@]}
 Skip image prepare: ${SKIP_IMAGE_PREPARE}
 Apply manifests: ${APPLY}
 EOF_CONFIRM
@@ -208,27 +251,97 @@ prepare_images() {
   done < "${IMAGE_INDEX}"
 }
 
-escape_sed() {
-  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+yaml_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+render_tokens_block() {
+  if [[ ${#AUTH_TOKENS[@]} -eq 0 ]]; then
+    printf ' []'
+    return 0
+  fi
+  printf '\n'
+  local token
+  for token in "${AUTH_TOKENS[@]}"; do
+    [[ -z "${token}" ]] && continue
+    printf '        - "%s"\n' "$(yaml_escape "${token}")"
+  done
+}
+
+render_keys_block() {
+  if [[ ${#AUTH_KEYS[@]} -eq 0 ]]; then
+    printf ' []'
+    return 0
+  fi
+  printf '\n'
+  local entry name key quota rest
+  for entry in "${AUTH_KEYS[@]}"; do
+    name="${entry%%:*}"
+    rest="${entry#*:}"
+    [[ "${rest}" != "${entry}" ]] || die "--auth-key format must be name:key[:quota]"
+    key="${rest%%:*}"
+    quota="0"
+    if [[ "${rest}" == *:* ]]; then quota="${rest#*:}"; fi
+    [[ -n "${name}" && -n "${key}" ]] || die "--auth-key format must be name:key[:quota]"
+    [[ "${quota}" =~ ^[0-9]+$ ]] || die "--auth-key quota must be an integer: ${entry}"
+    printf '        - name: "%s"\n' "$(yaml_escape "${name}")"
+    printf '          key: "%s"\n' "$(yaml_escape "${key}")"
+    printf '          quota_tokens: %s\n' "${quota}"
+    printf '          disabled: false\n'
+  done
 }
 
 render_manifest() {
   [[ -n "${IMAGE_TO_DEPLOY}" ]] || die "IMAGE_TO_DEPLOY is empty"
   local node_port_line=""
-  if [[ "${SERVICE_TYPE}" == "NodePort" && -n "${NODE_PORT}" ]]; then
+  if [[ "${SERVICE_TYPE}" == "NodePort" ]]; then
+    [[ -n "${NODE_PORT}" ]] || NODE_PORT="30088"
     node_port_line="nodePort: ${NODE_PORT}"
   fi
-  sed \
-    -e "s|{{NAMESPACE}}|$(escape_sed "${NAMESPACE}")|g" \
-    -e "s|{{APP_NAME}}|$(escape_sed "${INSTALL_NAME}")|g" \
-    -e "s|{{IMAGE}}|$(escape_sed "${IMAGE_TO_DEPLOY}")|g" \
-    -e "s|{{REPLICAS}}|$(escape_sed "${REPLICAS}")|g" \
-    -e "s|{{SERVICE_TYPE}}|$(escape_sed "${SERVICE_TYPE}")|g" \
-    -e "s|{{NODE_PORT_LINE}}|$(escape_sed "${node_port_line}")|g" \
-    -e "s|{{UPSTREAM_BASE_URL}}|$(escape_sed "${UPSTREAM_BASE_URL}")|g" \
-    -e "s|{{AUTH_ENABLED}}|$(escape_sed "${AUTH_ENABLED}")|g" \
-    -e "s|{{AUTH_TOKEN}}|$(escape_sed "${AUTH_TOKEN}")|g" \
-    "${MANIFEST_TEMPLATE}" > "${RENDERED_MANIFEST}"
+  local auth_tokens_block auth_keys_block
+  auth_tokens_block="$(render_tokens_block)"
+  auth_keys_block="$(render_keys_block)"
+
+  awk \
+    -v NAMESPACE="${NAMESPACE}" \
+    -v APP_NAME="${INSTALL_NAME}" \
+    -v IMAGE="${IMAGE_TO_DEPLOY}" \
+    -v REPLICAS="${REPLICAS}" \
+    -v SERVICE_TYPE="${SERVICE_TYPE}" \
+    -v NODE_PORT_LINE="${node_port_line}" \
+    -v UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL}" \
+    -v UPSTREAM_API_KEY="${UPSTREAM_API_KEY}" \
+    -v UPSTREAM_FORWARD_CLIENT_AUTHORIZATION="${UPSTREAM_FORWARD_CLIENT_AUTHORIZATION}" \
+    -v UPSTREAM_STRATEGY="${UPSTREAM_STRATEGY}" \
+    -v AUTH_ENABLED="${AUTH_ENABLED}" \
+    -v AUTH_TOKENS_BLOCK="${auth_tokens_block}" \
+    -v AUTH_KEYS_BLOCK="${auth_keys_block}" \
+    '
+    function repl(s, old, new, out, i) {
+      out=""
+      while ((i=index(s, old)) > 0) {
+        out = out substr(s, 1, i-1) new
+        s = substr(s, i + length(old))
+      }
+      return out s
+    }
+    {
+      line=$0
+      line=repl(line,"{{NAMESPACE}}",NAMESPACE)
+      line=repl(line,"{{APP_NAME}}",APP_NAME)
+      line=repl(line,"{{IMAGE}}",IMAGE)
+      line=repl(line,"{{REPLICAS}}",REPLICAS)
+      line=repl(line,"{{SERVICE_TYPE}}",SERVICE_TYPE)
+      line=repl(line,"{{NODE_PORT_LINE}}",NODE_PORT_LINE)
+      line=repl(line,"{{UPSTREAM_BASE_URL}}",UPSTREAM_BASE_URL)
+      line=repl(line,"{{UPSTREAM_API_KEY}}",UPSTREAM_API_KEY)
+      line=repl(line,"{{UPSTREAM_FORWARD_CLIENT_AUTHORIZATION}}",UPSTREAM_FORWARD_CLIENT_AUTHORIZATION)
+      line=repl(line,"{{UPSTREAM_STRATEGY}}",UPSTREAM_STRATEGY)
+      line=repl(line,"{{AUTH_ENABLED}}",AUTH_ENABLED)
+      line=repl(line,"{{AUTH_TOKENS_BLOCK}}",AUTH_TOKENS_BLOCK)
+      line=repl(line,"{{AUTH_KEYS_BLOCK}}",AUTH_KEYS_BLOCK)
+      print line
+    }' "${MANIFEST_TEMPLATE}" > "${RENDERED_MANIFEST}"
   ok "Rendered manifest: ${RENDERED_MANIFEST}"
 }
 

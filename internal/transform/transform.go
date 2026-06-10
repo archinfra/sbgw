@@ -72,7 +72,7 @@ func NormalizeNonStream(body []byte, opt Options) ([]byte, error) {
 		}
 		normalizeMessageMap(msg, opt)
 	}
-	return json.Marshal(root)
+	return MarshalNoEscape(root)
 }
 
 type StreamTracker struct {
@@ -125,7 +125,7 @@ func NormalizeSSEData(data []byte, opt Options, tracker *StreamTracker) ([]byte,
 		idx := choiceIndex(cm, pos)
 		normalizeDeltaMap(delta, opt, tracker.State(idx))
 	}
-	return json.Marshal(root)
+	return MarshalNoEscape(root)
 }
 
 func normalizeMessageMap(msg map[string]any, opt Options) {

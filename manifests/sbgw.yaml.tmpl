@@ -21,25 +21,40 @@ data:
       level: "info"
       format: "json"
       log_body: true
+      log_headers: false
       max_body_size: 8192
+      redact_headers:
+        - authorization
+        - x-api-key
+        - api-key
 
     auth:
       enabled: {{AUTH_ENABLED}}
       header: "Authorization"
-      tokens:
-        - "{{AUTH_TOKEN}}"
+      tokens:{{AUTH_TOKENS_BLOCK}}
+      keys:{{AUTH_KEYS_BLOCK}}
 
     upstream:
       base_url: "{{UPSTREAM_BASE_URL}}"
       timeout: "10m"
-      api_key: ""
-      forward_client_authorization: false
+      api_key: "{{UPSTREAM_API_KEY}}"
+      forward_client_authorization: {{UPSTREAM_FORWARD_CLIENT_AUTHORIZATION}}
+      strategy: "{{UPSTREAM_STRATEGY}}"
+      model_map: {}
+      endpoints:
+        - name: "default"
+          base_url: "{{UPSTREAM_BASE_URL}}"
+          api_key: "{{UPSTREAM_API_KEY}}"
+          weight: 1
+          timeout: "10m"
+          models: []
 
     transform:
       enabled: true
       inject_think_tag: true
       strip_reasoning_fields: true
       parse_think_from_content: true
+      reorder_system_messages: true
       reasoning_fields:
         - reasoning_content
         - reasoning

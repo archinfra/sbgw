@@ -43,6 +43,7 @@ func GinMiddleware(log *zap.Logger) gin.HandlerFunc {
 			zap.Int("size", c.Writer.Size()),
 			zap.Duration("latency", time.Since(start)),
 			zap.String("client_ip", c.ClientIP()),
+			zap.String("client", c.GetString("sbgw_client_name")),
 			zap.String("request_id", c.GetString("request_id")),
 		)
 	}

@@ -3,12 +3,13 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/archinfra/sbgw/internal/auth"
 	"github.com/archinfra/sbgw/internal/config"
 	"github.com/archinfra/sbgw/internal/transform"
 	"github.com/gin-gonic/gin"
@@ -20,20 +21,22 @@ type ChatProxy struct {
 	cfg       *config.Config
 	log       *zap.Logger
 	client    *http.Client
-	upstream  *url.URL
+	pool      *upstreamPool
+	auth      *auth.TokenStore
 	transform transform.Options
 }
 
-func NewChatProxy(cfg *config.Config, log *zap.Logger) (*ChatProxy, error) {
-	u, err := url.Parse(strings.TrimRight(cfg.Upstream.BaseURL, "/"))
+func NewChatProxy(cfg *config.Config, log *zap.Logger, tokenStore *auth.TokenStore) (*ChatProxy, error) {
+	pool, err := newUpstreamPool(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
 	return &ChatProxy{
-		cfg:      cfg,
-		log:      log,
-		client:   &http.Client{Timeout: cfg.Upstream.Timeout},
-		upstream: u,
+		cfg:    cfg,
+		log:    log,
+		client: &http.Client{},
+		pool:   pool,
+		auth:   tokenStore,
 		transform: transform.Options{
 			Enabled:               cfg.Transform.Enabled,
 			InjectThinkTag:        cfg.Transform.InjectThinkTag,
@@ -42,6 +45,24 @@ func NewChatProxy(cfg *config.Config, log *zap.Logger) (*ChatProxy, error) {
 			ReasoningFields:       cfg.Transform.ReasoningFields,
 		},
 	}, nil
+}
+
+func (p *ChatProxy) HandleModels(c *gin.Context) {
+	ids := p.pool.modelIDs(p.cfg.Upstream.ModelMap)
+	data := make([]gin.H, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, gin.H{"id": id, "object": "model", "owned_by": "sbgw"})
+	}
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+}
+
+func (p *ChatProxy) HandleUsage(c *gin.Context) {
+	clientID := c.GetString(auth.ContextClientID)
+	if !p.auth.Enabled() || clientID == "" || clientID == "anonymous" {
+		c.JSON(http.StatusOK, gin.H{"object": "list", "data": p.auth.Snapshots()})
+		return
+	}
+	c.JSON(http.StatusOK, p.auth.Snapshot(clientID))
 }
 
 func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
@@ -56,31 +77,76 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "read request body failed"}})
 		return
 	}
-	if p.cfg.Log.LogBody {
-		p.log.Info("upstream request", zap.String("request_id", reqID), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
+
+	body, reqInfo, _ := transform.NormalizeRequest(body, transform.RequestOptions{
+		Enabled:               p.cfg.Transform.Enabled,
+		ReorderSystemMessages: p.cfg.Transform.ReorderSystemMessages,
+	})
+	logicalModel := reqInfo.Model
+	upstreamModel := p.cfg.Upstream.ModelMap[logicalModel]
+	if upstreamModel != "" {
+		if rewritten, changed, err := transform.RewriteModel(body, upstreamModel); err == nil && changed {
+			body = rewritten
+		}
 	}
 
-	target := *p.upstream
+	ep := p.pool.selectEndpoint(logicalModel)
+	if ep == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "no upstream endpoint supports requested model", "model": logicalModel}})
+		return
+	}
+	inflight := ep.begin()
+	defer ep.end()
+
+	if p.cfg.Log.LogBody {
+		p.log.Info("gateway request body", zap.String("request_id", reqID), zap.String("client", c.GetString(auth.ContextClientName)), zap.String("model", logicalModel), zap.String("upstream_model", upstreamModel), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
+	}
+	if p.cfg.Log.LogHeaders {
+		p.log.Info("gateway request headers", zap.String("request_id", reqID), zap.Any("headers", redactHeaders(c.Request.Header, p.cfg.Log.RedactHeaders)))
+	}
+	if reqInfo.SystemMessagesReordered {
+		p.log.Info("system messages reordered", zap.String("request_id", reqID), zap.String("model", logicalModel))
+	}
+
+	target := *ep.url
 	target.Path = strings.TrimRight(target.Path, "/") + "/v1/chat/completions"
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target.String(), bytes.NewReader(body))
+	ctx := c.Request.Context()
+	cancel := func() {}
+	if ep.cfg.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, ep.cfg.Timeout)
+	}
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, c.Request.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
 		return
 	}
 	copyHeaders(req.Header, c.Request.Header)
-	if p.cfg.Upstream.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.cfg.Upstream.APIKey)
-	} else if !p.cfg.Upstream.ForwardClientAuthorization {
+	if ep.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.cfg.APIKey)
+	} else if ep.cfg.ForwardClientAuthorization == nil || !*ep.cfg.ForwardClientAuthorization {
 		// Local SK tokens are for gateway access. Do not leak them to upstream by default.
 		req.Header.Del("Authorization")
 	}
 	req.Header.Set("X-Request-ID", reqID)
 
 	start := time.Now()
+	p.log.Info("upstream selected",
+		zap.String("request_id", reqID),
+		zap.String("strategy", p.cfg.Upstream.Strategy),
+		zap.String("upstream", ep.cfg.Name),
+		zap.String("upstream_base_url", ep.cfg.BaseURL),
+		zap.String("model", logicalModel),
+		zap.String("upstream_model", upstreamModel),
+		zap.Bool("stream", reqInfo.Stream),
+		zap.Int64("inflight", inflight),
+	)
+
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.log.Error("upstream request failed", zap.String("request_id", reqID), zap.Error(err))
+		p.log.Error("upstream request failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "upstream request failed", "detail": err.Error()}})
 		return
 	}
@@ -88,33 +154,37 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 
 	copyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Writer.Header().Set("X-Request-ID", reqID)
+	c.Writer.Header().Set("X-SBGW-Upstream", ep.cfg.Name)
 	c.Status(resp.StatusCode)
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(contentType, "text/event-stream") {
-		p.handleStream(c, resp.Body, reqID, start)
+		p.handleStream(c, resp.Body, reqID, start, ep, logicalModel)
 		return
 	}
-	p.handleNonStream(c, resp.Body, reqID, start)
+	p.handleNonStream(c, resp.Body, reqID, start, ep, logicalModel)
 }
 
-func (p *ChatProxy) handleNonStream(c *gin.Context, body io.Reader, reqID string, start time.Time) {
+func (p *ChatProxy) handleNonStream(c *gin.Context, body io.Reader, reqID string, start time.Time, ep *upstreamEndpoint, model string) {
 	respBody, err := io.ReadAll(body)
 	if err != nil {
-		p.log.Error("read upstream response failed", zap.String("request_id", reqID), zap.Error(err))
+		p.log.Error("read upstream response failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
 		return
 	}
 	out, err := transform.NormalizeNonStream(respBody, p.transform)
 	if err != nil {
 		out = respBody
 	}
+	tokens := transform.ExtractTotalTokens(out)
+	p.recordUsage(c, tokens, reqID, model)
 	if p.cfg.Log.LogBody {
-		p.log.Info("upstream response", zap.String("request_id", reqID), zap.Duration("latency", time.Since(start)), zap.ByteString("body", limitBody(out, p.cfg.Log.MaxBodySize)))
+		p.log.Info("upstream response body", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Duration("latency", time.Since(start)), zap.Int64("total_tokens", tokens), zap.ByteString("body", limitBody(out, p.cfg.Log.MaxBodySize)))
 	}
+	p.log.Info("completion finished", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.String("model", model), zap.Int("status", c.Writer.Status()), zap.Int64("total_tokens", tokens), zap.Duration("latency", time.Since(start)), zap.Int64("inflight", ep.currentInflight()))
 	_, _ = c.Writer.Write(out)
 }
 
-func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, start time.Time) {
+func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, start time.Time, ep *upstreamEndpoint, model string) {
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
@@ -123,6 +193,7 @@ func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, s
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	chunks := 0
+	var totalTokens int64
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -137,6 +208,9 @@ func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, s
 		if err != nil {
 			outData = data
 		}
+		if n := transform.ExtractTotalTokens(outData); n > 0 {
+			totalTokens = n
+		}
 		_, _ = c.Writer.Write([]byte("data: "))
 		_, _ = c.Writer.Write(outData)
 		_, _ = c.Writer.Write([]byte("\n\n"))
@@ -146,15 +220,32 @@ func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, s
 		chunks++
 	}
 	if err := scanner.Err(); err != nil {
-		p.log.Error("stream read failed", zap.String("request_id", reqID), zap.Error(err))
+		p.log.Error("stream read failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
 	}
-	p.log.Info("stream completed", zap.String("request_id", reqID), zap.Int("chunks", chunks), zap.Duration("latency", time.Since(start)))
+	p.recordUsage(c, totalTokens, reqID, model)
+	p.log.Info("stream completed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.String("model", model), zap.Int("chunks", chunks), zap.Int64("total_tokens", totalTokens), zap.Duration("latency", time.Since(start)), zap.Int64("inflight", ep.currentInflight()))
+}
+
+func (p *ChatProxy) recordUsage(c *gin.Context, tokens int64, reqID string, model string) {
+	if tokens <= 0 || p.auth == nil {
+		return
+	}
+	clientID := c.GetString(auth.ContextClientID)
+	if clientID == "" {
+		return
+	}
+	snap := p.auth.RecordUsage(clientID, tokens)
+	if !snap.Unlimited {
+		c.Header("X-SBGW-Quota-Used", int64ToString(snap.UsedTokens))
+		c.Header("X-SBGW-Quota-Remaining", int64ToString(snap.RemainingTokens))
+	}
+	p.log.Info("client token usage recorded", zap.String("request_id", reqID), zap.String("client", snap.Name), zap.String("client_id", snap.ID), zap.String("model", model), zap.Int64("tokens", tokens), zap.Int64("used_tokens", snap.UsedTokens), zap.Int64("remaining_tokens", snap.RemainingTokens), zap.Bool("unlimited", snap.Unlimited))
 }
 
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		lk := strings.ToLower(k)
-		if lk == "host" || lk == "content-length" {
+		if lk == "host" || lk == "content-length" || lk == "connection" || lk == "keep-alive" || lk == "proxy-authenticate" || lk == "proxy-authorization" || lk == "te" || lk == "trailer" || lk == "transfer-encoding" || lk == "upgrade" {
 			continue
 		}
 		dst.Del(k)
@@ -167,7 +258,7 @@ func copyHeaders(dst, src http.Header) {
 func copyResponseHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		lk := strings.ToLower(k)
-		if lk == "content-length" || lk == "content-encoding" || lk == "transfer-encoding" {
+		if lk == "content-length" || lk == "content-encoding" || lk == "transfer-encoding" || lk == "connection" {
 			continue
 		}
 		dst.Del(k)
@@ -182,4 +273,45 @@ func limitBody(b []byte, max int64) []byte {
 		return b
 	}
 	return append(b[:max], []byte("...<truncated>")...)
+}
+
+func redactHeaders(h http.Header, redacted []string) map[string][]string {
+	deny := map[string]struct{}{}
+	for _, k := range redacted {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k != "" {
+			deny[k] = struct{}{}
+		}
+	}
+	out := map[string][]string{}
+	for k, vs := range h {
+		if _, ok := deny[strings.ToLower(k)]; ok {
+			out[k] = []string{"<redacted>"}
+			continue
+		}
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
+func int64ToString(v int64) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }

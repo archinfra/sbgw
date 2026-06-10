@@ -158,3 +158,36 @@ func TestNormalizeSSEUsesSeparateStatePerChoice(t *testing.T) {
 		t.Fatalf("expected two independent think close tags: %s", out)
 	}
 }
+
+func TestMarshalNoEscapeKeepsThinkTagsReadable(t *testing.T) {
+	in := []byte(`{"choices":[{"message":{"role":"assistant","content":"答案","reasoning":"思考"}}]}`)
+	out, err := NormalizeNonStream(in, defaultOpt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), `\u003c`) || strings.Contains(string(out), `\u003e`) {
+		t.Fatalf("html escaped think tag: %s", out)
+	}
+	if !strings.Contains(string(out), `<think>`) || !strings.Contains(string(out), `</think>`) {
+		t.Fatalf("missing raw think tag: %s", out)
+	}
+}
+
+func TestNormalizeRequestReordersSystemMessages(t *testing.T) {
+	in := []byte(`{"model":"qwen3.6","messages":[{"role":"user","content":"你好"},{"role":"system","content":"你是助手"},{"role":"assistant","content":"好"}],"stream":true}`)
+	out, info, err := NormalizeRequest(in, RequestOptions{Enabled: true, ReorderSystemMessages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.SystemMessagesReordered || info.Model != "qwen3.6" || !info.Stream {
+		t.Fatalf("bad info: %+v", info)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	msgs := root["messages"].([]any)
+	if msgs[0].(map[string]any)["role"] != "system" || msgs[1].(map[string]any)["role"] != "user" {
+		t.Fatalf("system message not first: %s", out)
+	}
+}

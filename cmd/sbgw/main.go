@@ -44,7 +44,7 @@ func main() {
 	r.Use(logger.GinMiddleware(log))
 
 	tokenStore := auth.NewTokenStore(cfg.Auth)
-	chatProxy, err := proxy.NewChatProxy(cfg, log)
+	chatProxy, err := proxy.NewChatProxy(cfg, log, tokenStore)
 	if err != nil {
 		log.Fatal("init chat proxy failed", zap.Error(err))
 	}
@@ -55,6 +55,8 @@ func main() {
 
 	v1 := r.Group("/v1")
 	v1.Use(auth.Middleware(tokenStore, log))
+	v1.GET("/models", chatProxy.HandleModels)
+	v1.GET("/usage", chatProxy.HandleUsage)
 	v1.Any("/chat/completions", chatProxy.HandleChatCompletions)
 
 	srv := &http.Server{
@@ -64,7 +66,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("sbgw started", zap.String("addr", cfg.Server.Addr), zap.String("upstream", cfg.Upstream.BaseURL), zap.String("version", version), zap.String("commit", commit))
+		log.Info("sbgw started", zap.String("addr", cfg.Server.Addr), zap.String("strategy", cfg.Upstream.Strategy), zap.Int("upstream_count", len(cfg.Upstream.Endpoints)), zap.String("version", version), zap.String("commit", commit))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("server failed", zap.Error(err))
 		}
