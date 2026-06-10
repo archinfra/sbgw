@@ -129,6 +129,8 @@ build_one_arch() {
       docker buildx build \
         --platform "${platform}" \
         --load \
+        --build-arg TARGETOS="linux" \
+        --build-arg TARGETARCH="${arch}" \
         --build-arg VERSION="${VERSION}" \
         --build-arg COMMIT="${COMMIT}" \
         --build-arg DATE="${DATE}" \
