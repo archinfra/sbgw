@@ -1,0 +1,10 @@
+.git
+.github
+bin
+dist
+.build-payload
+.build-payload-*
+payload.tar.gz
+*.run
+*.sha256
+*.log

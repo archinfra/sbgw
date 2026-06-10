@@ -1,0 +1,20 @@
+[
+  {
+    "name": "sbgw",
+    "arch": "amd64",
+    "platform": "linux/amd64",
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "tag": "sealos.hub:5000/kube4/sbgw:{{VERSION}}-amd64",
+    "tar": "sbgw-amd64.tar"
+  },
+  {
+    "name": "sbgw",
+    "arch": "arm64",
+    "platform": "linux/arm64",
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "tag": "sealos.hub:5000/kube4/sbgw:{{VERSION}}-arm64",
+    "tar": "sbgw-arm64.tar"
+  }
+]

@@ -1,0 +1,148 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+      - run: go mod tidy
+      - run: go test ./...
+      - run: go build -o /tmp/sbgw ./cmd/sbgw
+
+  docker-multiarch:
+    name: Build and publish multi-arch images
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun Registry
+        if: ${{ vars.PUBLISH_ALIYUN == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Login to Docker Hub
+        if: ${{ vars.PUBLISH_DOCKERHUB == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="sbgw"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION_TAG="${GITHUB_REF_NAME}"
+            EXTRA_TAG="latest"
+          else
+            VERSION_TAG="sha-${SHORT_SHA}"
+            EXTRA_TAG="main"
+          fi
+
+          tags=()
+          if [[ "${{ vars.PUBLISH_ALIYUN }}" == "true" ]]; then
+            base="${{ vars.ALIYUN_REGISTRY }}/${{ vars.ALIYUN_NAMESPACE }}/${IMAGE_NAME}"
+            tags+=("${base}:${VERSION_TAG}" "${base}:${EXTRA_TAG}")
+          fi
+          if [[ "${{ vars.PUBLISH_DOCKERHUB }}" == "true" ]]; then
+            base="${{ vars.DOCKERHUB_NAMESPACE }}/${IMAGE_NAME}"
+            tags+=("${base}:${VERSION_TAG}" "${base}:${EXTRA_TAG}")
+          fi
+
+          if [[ ${#tags[@]} -eq 0 ]]; then
+            tags=("sbgw:ci")
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo 'tags<<EOF'
+            printf '%s\n' "${tags[@]}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.head_commit.timestamp }}
+
+  run-packages:
+    name: Build offline run package (${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ amd64, arm64 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build .run package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            export VERSION="${GITHUB_REF_NAME}"
+          else
+            export VERSION="sha-${GITHUB_SHA::7}"
+          fi
+          export COMMIT="${GITHUB_SHA::7}"
+          export DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          bash build.sh --arch "${{ matrix.arch }}" --version "${VERSION}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbgw-run-${{ matrix.arch }}
+          path: |
+            dist/*.run
+            dist/*.sha256
+
+  github-release:
+    name: Upload run packages to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: run-packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.run
+            dist/*.sha256
