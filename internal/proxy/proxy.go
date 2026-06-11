@@ -18,12 +18,14 @@ import (
 )
 
 type ChatProxy struct {
-	cfg       *config.Config
-	log       *zap.Logger
-	client    *http.Client
-	pool      *upstreamPool
-	auth      *auth.TokenStore
-	transform transform.Options
+	cfg           *config.Config
+	log           *zap.Logger
+	client        *http.Client
+	pool          *upstreamPool
+	auth          *auth.TokenStore
+	transform     transform.Options
+	routesByPath  map[string]config.RouteConfig
+	routesByModel map[string]config.RouteConfig
 }
 
 func NewChatProxy(cfg *config.Config, log *zap.Logger, tokenStore *auth.TokenStore) (*ChatProxy, error) {
@@ -31,12 +33,22 @@ func NewChatProxy(cfg *config.Config, log *zap.Logger, tokenStore *auth.TokenSto
 	if err != nil {
 		return nil, err
 	}
+	routesByPath := map[string]config.RouteConfig{}
+	routesByModel := map[string]config.RouteConfig{}
+	for _, r := range cfg.Upstream.Routes {
+		routesByPath[strings.Trim(r.Path, "/")] = r
+		if r.Model != "" {
+			routesByModel[r.Model] = r
+		}
+	}
 	return &ChatProxy{
-		cfg:    cfg,
-		log:    log,
-		client: &http.Client{},
-		pool:   pool,
-		auth:   tokenStore,
+		cfg:           cfg,
+		log:           log,
+		client:        &http.Client{},
+		pool:          pool,
+		auth:          tokenStore,
+		routesByPath:  routesByPath,
+		routesByModel: routesByModel,
 		transform: transform.Options{
 			Enabled:               cfg.Transform.Enabled,
 			InjectThinkTag:        cfg.Transform.InjectThinkTag,
@@ -48,7 +60,22 @@ func NewChatProxy(cfg *config.Config, log *zap.Logger, tokenStore *auth.TokenSto
 }
 
 func (p *ChatProxy) HandleModels(c *gin.Context) {
-	ids := p.pool.modelIDs(p.cfg.Upstream.ModelMap)
+	routeParam := strings.Trim(c.Param("route"), "/")
+	if routeParam != "" {
+		route, ok, routeErr := p.resolveRoute(routeParam, "")
+		if routeErr != "" || !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": routeErr}})
+			return
+		}
+		id := route.Model
+		if id == "" {
+			id = route.Name
+		}
+		c.JSON(http.StatusOK, gin.H{"object": "list", "data": []gin.H{{"id": id, "object": "model", "owned_by": "sbgw", "route": route.Name}}})
+		return
+	}
+
+	ids := p.pool.modelIDs(p.cfg.Upstream.ModelMap, p.cfg.Upstream.Routes)
 	data := make([]gin.H, 0, len(ids))
 	for _, id := range ids {
 		data = append(data, gin.H{"id": id, "object": "model", "owned_by": "sbgw"})
@@ -82,34 +109,79 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		Enabled:               p.cfg.Transform.Enabled,
 		ReorderSystemMessages: p.cfg.Transform.ReorderSystemMessages,
 	})
+
+	routeParam := strings.Trim(c.Param("route"), "/")
+	route, routeOK, routeErr := p.resolveRoute(routeParam, reqInfo.Model)
+	if routeErr != "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": routeErr}})
+		return
+	}
+
 	logicalModel := reqInfo.Model
-	upstreamModel := p.cfg.Upstream.ModelMap[logicalModel]
+	if routeOK && route.Model != "" {
+		logicalModel = route.Model
+	}
+	upstreamModel := ""
+	if routeOK && route.UpstreamModel != "" {
+		upstreamModel = route.UpstreamModel
+	} else {
+		upstreamModel = p.cfg.Upstream.ModelMap[logicalModel]
+	}
+
+	if routeOK && len(route.RequestPatches) > 0 {
+		patches := make([]transform.RequestPatch, 0, len(route.RequestPatches))
+		for _, patch := range route.RequestPatches {
+			patches = append(patches, transform.RequestPatch{Op: patch.Op, Path: patch.Path, Value: patch.Value})
+		}
+		patched, result, err := transform.ApplyRequestPatches(body, patches)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "apply route request patches failed", "detail": err.Error()}})
+			return
+		}
+		body = patched
+		if result.Applied > 0 {
+			p.log.Info("route request patches applied", zap.String("request_id", reqID), zap.String("route", route.Name), zap.String("route_path", route.Path), zap.Int("patches", result.Applied))
+		}
+	}
+
 	if upstreamModel != "" {
 		if rewritten, changed, err := transform.RewriteModel(body, upstreamModel); err == nil && changed {
 			body = rewritten
 		}
+	} else if routeOK && route.Model != "" && reqInfo.Model != route.Model {
+		if rewritten, changed, err := transform.RewriteModel(body, route.Model); err == nil && changed {
+			body = rewritten
+		}
 	}
 
-	ep := p.pool.selectEndpoint(logicalModel)
+	epNames := []string(nil)
+	if routeOK {
+		epNames = route.Endpoints
+	}
+	ep := p.pool.selectEndpoint(logicalModel, epNames)
 	if ep == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "no upstream endpoint supports requested model", "model": logicalModel}})
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "no upstream endpoint supports requested model", "model": logicalModel, "route": route.Name}})
 		return
 	}
 	inflight := ep.begin()
 	defer ep.end()
 
 	if p.cfg.Log.LogBody {
-		p.log.Info("gateway request body", zap.String("request_id", reqID), zap.String("client", c.GetString(auth.ContextClientName)), zap.String("model", logicalModel), zap.String("upstream_model", upstreamModel), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
+		p.log.Info("gateway request body", zap.String("request_id", reqID), zap.String("client", c.GetString(auth.ContextClientName)), zap.String("route", route.Name), zap.String("model", logicalModel), zap.String("upstream_model", upstreamModel), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
 	}
 	if p.cfg.Log.LogHeaders {
 		p.log.Info("gateway request headers", zap.String("request_id", reqID), zap.Any("headers", redactHeaders(c.Request.Header, p.cfg.Log.RedactHeaders)))
 	}
 	if reqInfo.SystemMessagesReordered {
-		p.log.Info("system messages reordered", zap.String("request_id", reqID), zap.String("model", logicalModel))
+		p.log.Info("system messages reordered", zap.String("request_id", reqID), zap.String("model", logicalModel), zap.String("route", route.Name))
 	}
 
+	upstreamPath := "/v1/chat/completions"
+	if routeOK && route.UpstreamPath != "" {
+		upstreamPath = route.UpstreamPath
+	}
 	target := *ep.url
-	target.Path = strings.TrimRight(target.Path, "/") + "/v1/chat/completions"
+	target.Path = joinURLPath(target.Path, upstreamPath)
 
 	ctx := c.Request.Context()
 	cancel := func() {}
@@ -136,8 +208,11 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 	p.log.Info("upstream selected",
 		zap.String("request_id", reqID),
 		zap.String("strategy", p.cfg.Upstream.Strategy),
+		zap.String("route", route.Name),
+		zap.String("route_path", route.Path),
 		zap.String("upstream", ep.cfg.Name),
 		zap.String("upstream_base_url", ep.cfg.BaseURL),
+		zap.String("upstream_path", upstreamPath),
 		zap.String("model", logicalModel),
 		zap.String("upstream_model", upstreamModel),
 		zap.Bool("stream", reqInfo.Stream),
@@ -146,7 +221,7 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.log.Error("upstream request failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
+		p.log.Error("upstream request failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.String("route", route.Name), zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "upstream request failed", "detail": err.Error()}})
 		return
 	}
@@ -155,6 +230,9 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 	copyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Writer.Header().Set("X-Request-ID", reqID)
 	c.Writer.Header().Set("X-SBGW-Upstream", ep.cfg.Name)
+	if routeOK {
+		c.Writer.Header().Set("X-SBGW-Route", route.Name)
+	}
 	c.Status(resp.StatusCode)
 
 	contentType := resp.Header.Get("Content-Type")
@@ -163,6 +241,32 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 	p.handleNonStream(c, resp.Body, reqID, start, ep, logicalModel)
+}
+
+func (p *ChatProxy) resolveRoute(routeParam string, model string) (config.RouteConfig, bool, string) {
+	if routeParam != "" {
+		if r, ok := p.routesByPath[routeParam]; ok {
+			return r, true, ""
+		}
+		return config.RouteConfig{}, false, "unknown gateway model route: " + routeParam
+	}
+	if model != "" {
+		if r, ok := p.routesByModel[model]; ok {
+			return r, true, ""
+		}
+	}
+	return config.RouteConfig{}, false, ""
+}
+
+func joinURLPath(base string, suffix string) string {
+	base = strings.TrimRight(base, "/")
+	if suffix == "" {
+		return base
+	}
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	return base + suffix
 }
 
 func (p *ChatProxy) handleNonStream(c *gin.Context, body io.Reader, reqID string, start time.Time, ep *upstreamEndpoint, model string) {

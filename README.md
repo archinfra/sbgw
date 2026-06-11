@@ -16,9 +16,11 @@
 10. 支持多个客户端 API key，并可为每个 key 配置 token 额度。
 11. 支持多个 upstream endpoint：`round_robin`、`weighted_round_robin`、`random`、`weighted_random`、`least_inflight`。
 12. 支持 model 映射：前端传 `qwen3.6`，网关转发给上游真实 `qwen3.6-27b-w8a8`。
-13. 自动修复 Qwen3.5/Qwen3.6 严格要求的 system message 位置：后置 system 会被稳定移动到第一段消息区。
-14. 输出结构化 JSON 日志，包含 request_id、client、model、upstream、strategy、latency、inflight、token usage 等字段。
-15. 支持 Docker、Kubernetes NodePort/LoadBalancer/ClusterIP、GitHub Actions 多架构构建和离线 `.run` 包。
+13. 支持一个公网端口 + 多个 subpath：推荐 `/{route}/v1/chat/completions`，兼容旧的 `/v1/{route}/chat/completions`，把不同模型或同一模型的 thinking/direct 变体拆成网关模型。
+14. 支持通用请求 patch：可配置 `chat_template_kwargs.enable_thinking`、`enable_thinking`、`extra_body.enable_thinking` 等不同框架参数。
+15. 自动修复 Qwen3.5/Qwen3.6 严格要求的 system message 位置：后置 system 会被稳定移动到第一段消息区。
+16. 输出结构化 JSON 日志，包含 request_id、client、route、model、upstream、strategy、latency、inflight、token usage 等字段。
+17. 支持 Docker、Kubernetes NodePort/LoadBalancer/ClusterIP、GitHub Actions 多架构构建和离线 `.run` 包。
 
 ## 两层 API key 设计
 
@@ -69,19 +71,42 @@ upstream:
     qwen3.6: "qwen3.6-27b-w8a8"
     qwen3.5: "qwen3.5-32b-w8a8"
 
+  # 一个公网端口 + 多个 subpath：推荐 /{path}/v1/chat/completions，兼容 /v1/{path}/chat/completions。
+  routes:
+    - name: "qwen36-think"
+      path: "/qwen36-think"
+      model: "qwen3.6-thinking"
+      upstream_model: "qwen3.6-27b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen-a", "qwen-b"]
+      request_patches:
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: true
+    - name: "qwen36-direct"
+      path: "/qwen36-direct"
+      model: "qwen3.6-direct"
+      upstream_model: "qwen3.6-27b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen-a", "qwen-b"]
+      request_patches:
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: false
+
   endpoints:
     - name: "qwen-a"
       base_url: "http://127.0.0.1:18489"
       api_key: ""
       weight: 2
       timeout: "10m"
-      models: ["qwen3.6", "qwen3.5"]
+      models: ["qwen3.6", "qwen3.5", "qwen3.6-thinking", "qwen3.6-direct"]
     - name: "qwen-b"
       base_url: "http://127.0.0.1:18490"
       api_key: ""
       weight: 1
       timeout: "10m"
-      models: ["qwen3.6"]
+      models: ["qwen3.6", "qwen3.6-thinking", "qwen3.6-direct"]
 
 transform:
   enabled: true
@@ -105,6 +130,77 @@ transform:
 | `least_inflight` | 动态选择当前并发请求数最少的上游 |
 
 `endpoints[].models` 用的是网关逻辑模型名，不是上游真实模型名。为空表示该上游兜底支持所有模型。
+
+## 一个端口 + subpath + thinking/direct 模式
+
+`sbgw` 同时支持两种调用方式：
+
+```text
+/v1/chat/completions
+/{route}/v1/chat/completions   # 推荐
+/v1/{route}/chat/completions   # 兼容旧路径
+```
+
+例如：
+
+```bash
+curl http://127.0.0.1:12224/qwen36-direct/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-demo-user-001" \
+  -d '{
+    "model": "anything",
+    "messages": [{"role":"user","content":"直接回答，不要展开推理"}],
+    "stream": false
+  }'
+```
+
+命中 `qwen36-direct` route 后，网关会：
+
+1. 把对外逻辑模型固定为 `qwen3.6-direct`。
+2. 把上游真实模型改写为 `qwen3.6-27b-w8a8`。
+3. 注入配置中的请求 patch，例如 `chat_template_kwargs.enable_thinking=false`。
+4. 只在该 route 允许的 endpoints 中做负载均衡。
+
+也可以不用 subpath，直接在标准 `/v1/chat/completions` 里传 route 暴露的模型名：
+
+```json
+{
+  "model": "qwen3.6-direct",
+  "messages": [{"role":"user","content":"你好"}]
+}
+```
+
+### 不同推理框架的 thinking 参数
+
+`enable_thinking` 不是 OpenAI Chat Completions 标准参数，不同框架传法不同，所以网关只做通用 patch，不写死模型逻辑：
+
+```yaml
+# vLLM / SGLang 常见写法
+request_patches:
+  - op: set
+    path: "chat_template_kwargs.enable_thinking"
+    value: false
+
+# 阿里云 DashScope / Model Studio 兼容接口常见写法
+request_patches:
+  - op: set
+    path: "enable_thinking"
+    value: false
+
+# 某些 SDK 配置文件/代理层需要 extra_body
+request_patches:
+  - op: set
+    path: "extra_body.enable_thinking"
+    value: false
+```
+
+需要删除客户端传来的字段时：
+
+```yaml
+request_patches:
+  - op: delete
+    path: "enable_thinking"
+```
 
 ## system message 位置修复
 
@@ -169,6 +265,15 @@ curl http://127.0.0.1:12224/v1/usage \
   --service-type NodePort \
   --node-port 30088 \
   -n aict -y
+```
+
+
+需要完整自定义多 route、多 upstream、thinking/direct 规则时，直接使用完整配置文件：
+
+```bash
+cp config.example.yaml config-prod.yaml
+# 修改 config-prod.yaml 中的 upstream.routes / endpoints / auth
+./sbgw-v0.1.0-linux-amd64.run install   --registry sealos.hub:5000/kube4   --config-file ./config-prod.yaml   --service-type NodePort   --node-port 30088   -n aict -y
 ```
 
 上游不需要 key 时：

@@ -53,6 +53,7 @@ type UpstreamConfig struct {
 	Strategy                   string                   `mapstructure:"strategy"`
 	ModelMap                   map[string]string        `mapstructure:"model_map"`
 	Endpoints                  []UpstreamEndpointConfig `mapstructure:"endpoints"`
+	Routes                     []RouteConfig            `mapstructure:"routes"`
 }
 
 type UpstreamEndpointConfig struct {
@@ -63,6 +64,25 @@ type UpstreamEndpointConfig struct {
 	ForwardClientAuthorization *bool         `mapstructure:"forward_client_authorization"`
 	Weight                     int           `mapstructure:"weight"`
 	Models                     []string      `mapstructure:"models"`
+}
+
+// RouteConfig exposes a gateway-local subpath as a logical model variant.
+// Example: /qwen36-think/v1/chat/completions can route to upstream model
+// qwen3.6-27b-w8a8 and inject framework-specific thinking parameters.
+type RouteConfig struct {
+	Name           string               `mapstructure:"name"`
+	Path           string               `mapstructure:"path"`
+	Model          string               `mapstructure:"model"`
+	UpstreamModel  string               `mapstructure:"upstream_model"`
+	UpstreamPath   string               `mapstructure:"upstream_path"`
+	Endpoints      []string             `mapstructure:"endpoints"`
+	RequestPatches []RequestPatchConfig `mapstructure:"request_patches"`
+}
+
+type RequestPatchConfig struct {
+	Op    string `mapstructure:"op"`
+	Path  string `mapstructure:"path"`
+	Value any    `mapstructure:"value"`
 }
 
 type TransformConfig struct {
@@ -143,24 +163,59 @@ func normalizeUpstreamDefaults(cfg *Config) {
 			ForwardClientAuthorization: boolPtr(cfg.Upstream.ForwardClientAuthorization),
 			Weight:                     1,
 		}}
-		return
+	} else {
+		for i := range cfg.Upstream.Endpoints {
+			ep := &cfg.Upstream.Endpoints[i]
+			ep.Name = strings.TrimSpace(ep.Name)
+			if ep.Name == "" {
+				ep.Name = fmt.Sprintf("upstream-%d", i+1)
+			}
+			if ep.Timeout == 0 {
+				ep.Timeout = cfg.Upstream.Timeout
+			}
+			if ep.Weight <= 0 {
+				ep.Weight = 1
+			}
+			if ep.ForwardClientAuthorization == nil {
+				ep.ForwardClientAuthorization = boolPtr(cfg.Upstream.ForwardClientAuthorization)
+			}
+		}
 	}
-	for i := range cfg.Upstream.Endpoints {
-		ep := &cfg.Upstream.Endpoints[i]
-		ep.Name = strings.TrimSpace(ep.Name)
-		if ep.Name == "" {
-			ep.Name = fmt.Sprintf("upstream-%d", i+1)
+
+	for i := range cfg.Upstream.Routes {
+		r := &cfg.Upstream.Routes[i]
+		r.Name = strings.TrimSpace(r.Name)
+		r.Path = normalizeRoutePath(r.Path)
+		if r.Name == "" {
+			r.Name = strings.TrimPrefix(r.Path, "/")
 		}
-		if ep.Timeout == 0 {
-			ep.Timeout = cfg.Upstream.Timeout
+		if r.Model == "" {
+			r.Model = r.Name
 		}
-		if ep.Weight <= 0 {
-			ep.Weight = 1
+		if r.UpstreamPath == "" {
+			r.UpstreamPath = "/v1/chat/completions"
 		}
-		if ep.ForwardClientAuthorization == nil {
-			ep.ForwardClientAuthorization = boolPtr(cfg.Upstream.ForwardClientAuthorization)
+		if !strings.HasPrefix(r.UpstreamPath, "/") {
+			r.UpstreamPath = "/" + r.UpstreamPath
+		}
+		for j := range r.RequestPatches {
+			p := &r.RequestPatches[j]
+			p.Op = strings.TrimSpace(strings.ToLower(p.Op))
+			if p.Op == "" {
+				p.Op = "set"
+			}
+			p.Path = strings.TrimSpace(p.Path)
 		}
 	}
+}
+
+func normalizeRoutePath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return ""
+	}
+	return "/" + path
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -169,9 +224,46 @@ func validate(cfg *Config) error {
 	if len(cfg.Upstream.Endpoints) == 0 {
 		return fmt.Errorf("at least one upstream endpoint is required")
 	}
+	endpointNames := map[string]struct{}{}
 	for _, ep := range cfg.Upstream.Endpoints {
 		if strings.TrimSpace(ep.BaseURL) == "" {
 			return fmt.Errorf("upstream endpoint %q base_url is required", ep.Name)
+		}
+		endpointNames[ep.Name] = struct{}{}
+	}
+	seenRoutes := map[string]struct{}{}
+	for _, r := range cfg.Upstream.Routes {
+		if r.Name == "" {
+			return fmt.Errorf("upstream route name is required")
+		}
+		if r.Path == "" {
+			return fmt.Errorf("upstream route %q path is required", r.Name)
+		}
+		if strings.Contains(strings.Trim(r.Path, "/"), "/") {
+			return fmt.Errorf("upstream route %q path must be a single subpath segment, got %q", r.Name, r.Path)
+		}
+		if _, ok := seenRoutes[r.Path]; ok {
+			return fmt.Errorf("duplicate upstream route path %q", r.Path)
+		}
+		seenRoutes[r.Path] = struct{}{}
+		for _, epName := range r.Endpoints {
+			epName = strings.TrimSpace(epName)
+			if epName == "" {
+				continue
+			}
+			if _, ok := endpointNames[epName]; !ok {
+				return fmt.Errorf("upstream route %q references unknown endpoint %q", r.Name, epName)
+			}
+		}
+		for _, p := range r.RequestPatches {
+			if p.Path == "" {
+				return fmt.Errorf("upstream route %q has request patch with empty path", r.Name)
+			}
+			switch p.Op {
+			case "set", "delete":
+			default:
+				return fmt.Errorf("upstream route %q has unsupported request patch op %q", r.Name, p.Op)
+			}
 		}
 	}
 	switch cfg.Upstream.Strategy {

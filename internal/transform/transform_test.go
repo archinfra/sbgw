@@ -191,3 +191,54 @@ func TestNormalizeRequestReordersSystemMessages(t *testing.T) {
 		t.Fatalf("system message not first: %s", out)
 	}
 }
+
+func TestApplyRequestPatchesSetsNestedThinkingFlags(t *testing.T) {
+	in := []byte(`{"model":"qwen36-direct","messages":[{"role":"user","content":"hi"}]}`)
+	out, result, err := ApplyRequestPatches(in, []RequestPatch{
+		{Op: "set", Path: "chat_template_kwargs.enable_thinking", Value: false},
+		{Op: "set", Path: "enable_thinking", Value: false},
+		{Op: "set", Path: "extra_body.enable_thinking", Value: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied != 3 || !result.Changed {
+		t.Fatalf("bad patch result: %+v", result)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	if root["enable_thinking"] != false {
+		t.Fatalf("top-level enable_thinking not set: %s", out)
+	}
+	if root["chat_template_kwargs"].(map[string]any)["enable_thinking"] != false {
+		t.Fatalf("chat_template_kwargs.enable_thinking not set: %s", out)
+	}
+	if root["extra_body"].(map[string]any)["enable_thinking"] != false {
+		t.Fatalf("extra_body.enable_thinking not set: %s", out)
+	}
+}
+
+func TestApplyRequestPatchesDelete(t *testing.T) {
+	in := []byte(`{"model":"qwen","enable_thinking":true,"chat_template_kwargs":{"enable_thinking":true}}`)
+	out, result, err := ApplyRequestPatches(in, []RequestPatch{
+		{Op: "delete", Path: "enable_thinking"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied != 1 || !result.Changed {
+		t.Fatalf("bad patch result: %+v", result)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := root["enable_thinking"]; ok {
+		t.Fatalf("enable_thinking should be deleted: %s", out)
+	}
+	if root["chat_template_kwargs"].(map[string]any)["enable_thinking"] != true {
+		t.Fatalf("unrelated nested field changed: %s", out)
+	}
+}

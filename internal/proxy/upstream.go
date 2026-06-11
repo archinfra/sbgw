@@ -43,15 +43,22 @@ func newUpstreamPool(cfg config.UpstreamConfig) (*upstreamPool, error) {
 	return &upstreamPool{strategy: cfg.Strategy, items: items}, nil
 }
 
-func (p *upstreamPool) selectEndpoint(model string) *upstreamEndpoint {
+func (p *upstreamPool) selectEndpoint(model string, endpointNames []string) *upstreamEndpoint {
+	allowed := allowedEndpointNames(endpointNames)
 	candidates := make([]*upstreamEndpoint, 0, len(p.items))
 	for _, ep := range p.items {
+		if !endpointAllowed(ep.cfg.Name, allowed) {
+			continue
+		}
 		if ep.supports(model) {
 			candidates = append(candidates, ep)
 		}
 	}
 	if len(candidates) == 0 {
 		for _, ep := range p.items {
+			if !endpointAllowed(ep.cfg.Name, allowed) {
+				continue
+			}
 			if len(ep.models) == 0 {
 				candidates = append(candidates, ep)
 			}
@@ -75,6 +82,31 @@ func (p *upstreamPool) selectEndpoint(model string) *upstreamEndpoint {
 	default:
 		return weightedRoundRobin(candidates, p.rr.Add(1)-1)
 	}
+}
+
+func allowedEndpointNames(names []string) map[string]struct{} {
+	if len(names) == 0 {
+		return nil
+	}
+	out := map[string]struct{}{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out[name] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func endpointAllowed(name string, allowed map[string]struct{}) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	_, ok := allowed[name]
+	return ok
 }
 
 func (e *upstreamEndpoint) supports(model string) bool {
@@ -154,12 +186,19 @@ func weight(ep *upstreamEndpoint) int {
 	return ep.cfg.Weight
 }
 
-func (p *upstreamPool) modelIDs(modelMap map[string]string) []string {
+func (p *upstreamPool) modelIDs(modelMap map[string]string, routes []config.RouteConfig) []string {
 	seen := map[string]struct{}{}
 	for logical := range modelMap {
 		logical = strings.TrimSpace(logical)
 		if logical != "" {
 			seen[logical] = struct{}{}
+		}
+	}
+
+	for _, route := range routes {
+		model := strings.TrimSpace(route.Model)
+		if model != "" {
+			seen[model] = struct{}{}
 		}
 	}
 	for _, ep := range p.items {

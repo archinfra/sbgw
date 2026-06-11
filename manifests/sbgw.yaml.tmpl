@@ -40,7 +40,50 @@ data:
       api_key: "{{UPSTREAM_API_KEY}}"
       forward_client_authorization: {{UPSTREAM_FORWARD_CLIENT_AUTHORIZATION}}
       strategy: "{{UPSTREAM_STRATEGY}}"
-      model_map: {}
+      model_map:
+        qwen3.6: "qwen3.6-27b-w8a8"
+        qwen3.5: "qwen3.5-32b-w8a8"
+      routes:
+        - name: "qwen36-think"
+          path: "/qwen36-think"
+          model: "qwen3.6-thinking"
+          upstream_model: "qwen3.6-27b-w8a8"
+          upstream_path: "/v1/chat/completions"
+          endpoints: ["default"]
+          request_patches:
+            - op: set
+              path: "chat_template_kwargs.enable_thinking"
+              value: true
+        - name: "qwen36-direct"
+          path: "/qwen36-direct"
+          model: "qwen3.6-direct"
+          upstream_model: "qwen3.6-27b-w8a8"
+          upstream_path: "/v1/chat/completions"
+          endpoints: ["default"]
+          request_patches:
+            - op: set
+              path: "chat_template_kwargs.enable_thinking"
+              value: false
+        - name: "qwen35-think"
+          path: "/qwen35-think"
+          model: "qwen3.5-thinking"
+          upstream_model: "qwen3.5-32b-w8a8"
+          upstream_path: "/v1/chat/completions"
+          endpoints: ["default"]
+          request_patches:
+            - op: set
+              path: "chat_template_kwargs.enable_thinking"
+              value: true
+        - name: "qwen35-direct"
+          path: "/qwen35-direct"
+          model: "qwen3.5-direct"
+          upstream_model: "qwen3.5-32b-w8a8"
+          upstream_path: "/v1/chat/completions"
+          endpoints: ["default"]
+          request_patches:
+            - op: set
+              path: "chat_template_kwargs.enable_thinking"
+              value: false
       endpoints:
         - name: "default"
           base_url: "{{UPSTREAM_BASE_URL}}"

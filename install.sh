@@ -31,6 +31,7 @@ AUTH_ENABLED="true"
 AUTH_TOKEN_SET="false"
 AUTH_TOKENS=("sk-local-dev-001")
 AUTH_KEYS=()
+CONFIG_FILE=""
 WAIT_TIMEOUT="120s"
 DELETE_NAMESPACE="false"
 
@@ -70,6 +71,7 @@ Install options:
   --forward-client-authorization true|false
                                   Forward client Authorization only when upstream-api-key is empty. Default: false
   --upstream-strategy <strategy> round_robin|weighted_round_robin|random|weighted_random|least_inflight
+  --config-file <path>          Use a full config.yaml. Useful for routes/subpaths/multiple upstreams.
   --auth-enabled true|false      Enable gateway SK auth. Default: true
   --auth-token <sk>              Gateway SK token. Can be repeated. First usage replaces default token.
   --auth-tokens <a,b,c>          Comma separated gateway SK tokens. Replaces default token.
@@ -125,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --upstream-api-key) UPSTREAM_API_KEY="${2:-}"; shift 2 ;;
     --forward-client-authorization) UPSTREAM_FORWARD_CLIENT_AUTHORIZATION="$(parse_bool "${2:-}")"; shift 2 ;;
     --upstream-strategy) UPSTREAM_STRATEGY="${2:-}"; shift 2 ;;
+    --config-file) CONFIG_FILE="${2:-}"; shift 2 ;;
     --auth-enabled) AUTH_ENABLED="$(parse_bool "${2:-}")"; shift 2 ;;
     --auth-token)
       if [[ "${AUTH_TOKEN_SET}" != "true" ]]; then AUTH_TOKENS=(); AUTH_TOKEN_SET="true"; fi
@@ -149,6 +152,9 @@ case "${UPSTREAM_STRATEGY}" in
   round_robin|weighted_round_robin|random|weighted_random|least_inflight) ;;
   *) die "Unsupported --upstream-strategy: ${UPSTREAM_STRATEGY}" ;;
 esac
+if [[ -n "${CONFIG_FILE}" && ! -f "${CONFIG_FILE}" ]]; then
+  die "--config-file not found: ${CONFIG_FILE}"
+fi
 
 cleanup() { rm -rf "${WORKDIR}"; }
 trap cleanup EXIT
@@ -192,6 +198,7 @@ Upstream strategy: ${UPSTREAM_STRATEGY}
 Auth enabled: ${AUTH_ENABLED}
 Gateway tokens: ${#AUTH_TOKENS[@]}
 Gateway quota keys: ${#AUTH_KEYS[@]}
+Config file: $( [[ -n "${CONFIG_FILE}" ]] && printf "%s" "${CONFIG_FILE}" || printf "<generated>" )
 Skip image prepare: ${SKIP_IMAGE_PREPARE}
 Apply manifests: ${APPLY}
 EOF_CONFIRM
@@ -291,6 +298,31 @@ render_keys_block() {
   done
 }
 
+render_custom_config_manifest() {
+  local input_manifest="$1" output_manifest="$2" config_file="$3"
+  awk -v config_file="${config_file}" '
+    BEGIN {
+      while ((getline line < config_file) > 0) {
+        cfg = cfg "    " line "\n"
+      }
+      close(config_file)
+    }
+    $0 == "  config.yaml: |" {
+      print
+      printf "%s", cfg
+      skip = 1
+      next
+    }
+    skip && $0 == "---" {
+      skip = 0
+      print
+      next
+    }
+    skip { next }
+    { print }
+  ' "${input_manifest}" > "${output_manifest}"
+}
+
 render_manifest() {
   [[ -n "${IMAGE_TO_DEPLOY}" ]] || die "IMAGE_TO_DEPLOY is empty"
   local node_port_line=""
@@ -342,6 +374,11 @@ render_manifest() {
       line=repl(line,"{{AUTH_KEYS_BLOCK}}",AUTH_KEYS_BLOCK)
       print line
     }' "${MANIFEST_TEMPLATE}" > "${RENDERED_MANIFEST}"
+  if [[ -n "${CONFIG_FILE}" ]]; then
+    local tmp_manifest="${RENDERED_MANIFEST}.tmp"
+    render_custom_config_manifest "${RENDERED_MANIFEST}" "${tmp_manifest}" "${CONFIG_FILE}"
+    mv "${tmp_manifest}" "${RENDERED_MANIFEST}"
+  fi
   ok "Rendered manifest: ${RENDERED_MANIFEST}"
 }
 

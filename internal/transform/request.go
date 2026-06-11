@@ -1,6 +1,9 @@
 package transform
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type RequestOptions struct {
 	Enabled               bool
@@ -11,6 +14,17 @@ type RequestInfo struct {
 	Model                   string
 	Stream                  bool
 	SystemMessagesReordered bool
+}
+
+type RequestPatch struct {
+	Op    string
+	Path  string
+	Value any
+}
+
+type PatchResult struct {
+	Changed bool
+	Applied int
 }
 
 func NormalizeRequest(body []byte, opt RequestOptions) ([]byte, RequestInfo, error) {
@@ -63,6 +77,105 @@ func RewriteModel(body []byte, upstreamModel string) ([]byte, bool, error) {
 		return body, false, nil
 	}
 	return out, true, nil
+}
+
+func ApplyRequestPatches(body []byte, patches []RequestPatch) ([]byte, PatchResult, error) {
+	res := PatchResult{}
+	if len(patches) == 0 {
+		return body, res, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body, res, err
+	}
+	for _, patch := range patches {
+		op := strings.TrimSpace(strings.ToLower(patch.Op))
+		if op == "" {
+			op = "set"
+		}
+		path := splitPatchPath(patch.Path)
+		if len(path) == 0 {
+			continue
+		}
+		switch op {
+		case "set":
+			if setPatchValue(root, path, patch.Value) {
+				res.Changed = true
+				res.Applied++
+			}
+		case "delete":
+			if deletePatchValue(root, path) {
+				res.Changed = true
+				res.Applied++
+			}
+		}
+	}
+	if !res.Changed {
+		return body, res, nil
+	}
+	out, err := MarshalNoEscape(root)
+	if err != nil {
+		return body, res, err
+	}
+	return out, res, nil
+}
+
+func splitPatchPath(path string) []string {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, ".")
+	if path == "" {
+		return nil
+	}
+	parts := strings.Split(path, ".")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func setPatchValue(root map[string]any, path []string, value any) bool {
+	cur := root
+	for _, key := range path[:len(path)-1] {
+		next, ok := cur[key].(map[string]any)
+		if !ok || next == nil {
+			next = map[string]any{}
+			cur[key] = next
+		}
+		cur = next
+	}
+	leaf := path[len(path)-1]
+	if existing, ok := cur[leaf]; ok && valuesEqual(existing, value) {
+		return false
+	}
+	cur[leaf] = value
+	return true
+}
+
+func deletePatchValue(root map[string]any, path []string) bool {
+	cur := root
+	for _, key := range path[:len(path)-1] {
+		next, ok := cur[key].(map[string]any)
+		if !ok || next == nil {
+			return false
+		}
+		cur = next
+	}
+	leaf := path[len(path)-1]
+	if _, ok := cur[leaf]; !ok {
+		return false
+	}
+	delete(cur, leaf)
+	return true
+}
+
+func valuesEqual(a, b any) bool {
+	ab, aerr := json.Marshal(a)
+	bb, berr := json.Marshal(b)
+	return aerr == nil && berr == nil && string(ab) == string(bb)
 }
 
 func reorderSystemMessages(msgs []any) ([]any, bool) {
