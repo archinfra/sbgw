@@ -100,9 +100,16 @@ PY
 
 copy_payload_common() {
   local payload_dir="$1"
-  mkdir -p "${payload_dir}/manifests" "${payload_dir}/config"
+  mkdir -p "${payload_dir}/manifests" "${payload_dir}/config" "${payload_dir}/docs"
   cp -a "${ROOT_DIR}/manifests/." "${payload_dir}/manifests/"
   cp "${ROOT_DIR}/config.example.yaml" "${payload_dir}/config/config.example.yaml"
+  if [[ -f "${ROOT_DIR}/config.multi-model.example.yaml" ]]; then
+    cp "${ROOT_DIR}/config.multi-model.example.yaml" "${payload_dir}/config/config.multi-model.example.yaml"
+  fi
+  cp "${ROOT_DIR}/README.md" "${payload_dir}/docs/README.md" 2>/dev/null || true
+  if [[ -d "${ROOT_DIR}/docs" ]]; then
+    cp -a "${ROOT_DIR}/docs/." "${payload_dir}/docs/"
+  fi
   cp "${ROOT_DIR}/VERSION" "${payload_dir}/VERSION" 2>/dev/null || printf '%s\n' "${VERSION}" > "${payload_dir}/VERSION"
 }
 

@@ -41,20 +41,22 @@ warn() { printf '[WARN] %s\n' "$*"; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  cat <<USAGE
+  cat <<'USAGE'
 sbgw offline installer
 
 Usage:
   ./sbgw-<version>-linux-<arch>.run install [options]
   ./sbgw-<version>-linux-<arch>.run status [options]
   ./sbgw-<version>-linux-<arch>.run uninstall [options]
+  ./sbgw-<version>-linux-<arch>.run example-config
   ./sbgw-<version>-linux-<arch>.run help
 
 Actions:
-  install      Load/tag/push image, render Kubernetes manifests and apply them.
-  status       Show Kubernetes resources.
-  uninstall    Delete Deployment/Service/ConfigMap. Namespace is kept by default.
-  help         Show this help.
+  install         Load/tag/push image, render Kubernetes manifests and apply them.
+  status          Show Kubernetes resources.
+  uninstall       Delete Deployment/Service/ConfigMap. Namespace is kept by default.
+  example-config  Print a production-style multi-model config example to stdout.
+  help            Show this help.
 
 Install options:
   --registry <repo-prefix>       Target registry namespace, e.g. sealos.hub:5000/kube4
@@ -66,31 +68,225 @@ Install options:
   --replicas <n>                 Deployment replicas. Default: 1
   --service-type <type>          ClusterIP|NodePort|LoadBalancer. Default: NodePort
   --node-port <port>             NodePort when service-type=NodePort. Default: 30088
-  --upstream-base-url <url>      Upstream OpenAI-compatible base URL
-  --upstream-api-key <sk>        Upstream API key. Empty means upstream does not need key.
+
+  Simple single-upstream flags:
+  --upstream-base-url <url>      One upstream OpenAI-compatible base URL.
+  --upstream-api-key <sk>        Upstream model-service key. Empty means upstream does not need key.
   --forward-client-authorization true|false
                                   Forward client Authorization only when upstream-api-key is empty. Default: false
   --upstream-strategy <strategy> round_robin|weighted_round_robin|random|weighted_random|least_inflight
-  --config-file <path>          Use a full config.yaml. Useful for routes/subpaths/multiple upstreams.
+
+  Multi-model / multi-upstream / thinking-direct split:
+  --config-file <path>           Use a full config.yaml. This is the recommended way for multiple models,
+                                  multiple upstream endpoints, route prefixes, and thinking/direct variants.
+
+  Gateway client auth:
   --auth-enabled true|false      Enable gateway SK auth. Default: true
   --auth-token <sk>              Gateway SK token. Can be repeated. First usage replaces default token.
   --auth-tokens <a,b,c>          Comma separated gateway SK tokens. Replaces default token.
   --auth-key <name:key[:quota]>  Gateway key with optional token quota. Can be repeated.
+                                  Example: --auth-key user-a:sk-user-a:1000000
+
+  Other:
   --wait-timeout <duration>      kubectl rollout wait timeout. Default: 120s
   --no-apply                     Render manifest only, do not kubectl apply
   --dry-run                      Print rendered manifest, do not apply
   --delete-namespace             uninstall also deletes namespace
   -y, --yes                      Skip confirmation
 
-Examples:
+Recommended multi-model usage:
+  # 1) Generate final example config.
+  ./sbgw-v0.1.0-linux-amd64.run example-config > config.multi-model.yaml
+
+  # 2) Edit upstream addresses, upstream API keys, gateway user keys, and quotas.
+  vi config.multi-model.yaml
+
+  # 3) Install with one NodePort and many route prefixes.
   ./sbgw-v0.1.0-linux-amd64.run install \
     --registry sealos.hub:5000/kube4 \
-    --upstream-base-url http://qwen-vllm.aict.svc:8000 \
-    --upstream-api-key sk-upstream-xxx \
-    --auth-key user-a:sk-user-a:1000000 \
-    --auth-key user-b:sk-user-b:500000 \
+    --config-file ./config.multi-model.yaml \
+    --service-type NodePort \
+    --node-port 30088 \
     -n aict -y
+
+Client base_url examples:
+  http://<node-ip>:30088/qwen36-direct/v1   # Qwen3.6 non-thinking
+  http://<node-ip>:30088/qwen36-think/v1    # Qwen3.6 thinking
+  http://<node-ip>:30088/qwen35-direct/v1   # Qwen3.5 non-thinking
+  http://<node-ip>:30088/qwen35-think/v1    # Qwen3.5 thinking
+
+Curl example:
+  curl http://<node-ip>:30088/qwen36-direct/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer sk-demo-user-001" \
+    -d '{"model":"anything","messages":[{"role":"user","content":"直接回答"}],"stream":false}'
+
+Notes:
+  - Gateway auth keys are configured under auth.* and are used by frontends/users.
+  - Upstream API keys are configured under upstream.endpoints[].api_key and are used only to call model services.
+  - For multiple models/routes, prefer --config-file instead of many CLI flags.
 USAGE
+}
+
+
+print_example_config() {
+  cat <<'YAML'
+# sbgw final multi-model example
+#
+# Goal:
+#   One Gateway Service/NodePort, many OpenAI-compatible route prefixes.
+#
+# Recommended client base_url:
+#   http://<node-ip>:30088/qwen36-direct/v1   # Qwen3.6 non-thinking
+#   http://<node-ip>:30088/qwen36-think/v1    # Qwen3.6 thinking
+#   http://<node-ip>:30088/qwen35-direct/v1   # Qwen3.5 non-thinking
+#   http://<node-ip>:30088/qwen35-think/v1    # Qwen3.5 thinking
+#
+# Two-layer API key rule:
+#   auth.*                         = gateway/frontend/user API keys
+#   upstream.endpoints[].api_key   = upstream model-service API keys
+#
+# If upstream does not require auth, keep endpoints[].api_key empty.
+
+server:
+  addr: ":12224"
+  mode: "release"
+
+log:
+  level: "info"
+  format: "json"
+  log_body: true
+  log_headers: false
+  max_body_size: 8192
+  redact_headers:
+    - authorization
+    - x-api-key
+    - api-key
+
+# First layer: gateway client keys.
+auth:
+  enabled: true
+  header: "Authorization"
+  tokens: []
+  keys:
+    - name: "demo-user"
+      key: "sk-demo-user-001"
+      quota_tokens: 1000000
+      disabled: false
+    - name: "ops-user"
+      key: "sk-ops-user-001"
+      quota_tokens: 5000000
+      disabled: false
+
+# Second layer: upstream model services.
+upstream:
+  timeout: "10m"
+  strategy: "weighted_round_robin"
+  forward_client_authorization: false
+
+  # Optional compatibility for /v1/chat/completions.
+  # With route-prefix URLs, clients may send model=anything because the route decides the real model.
+  model_map:
+    qwen3.6: "qwen3.6-27b-w8a8"
+    qwen3.5: "qwen3.5-32b-w8a8"
+
+  # Route-prefix API:
+  #   /qwen36-direct/v1/chat/completions
+  #   /qwen36-think/v1/chat/completions
+  #   /qwen35-direct/v1/chat/completions
+  #   /qwen35-think/v1/chat/completions
+  routes:
+    - name: "qwen36-direct"
+      path: "/qwen36-direct"
+      model: "qwen3.6-direct"
+      upstream_model: "qwen3.6-27b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen36-a", "qwen36-b"]
+      request_patches:
+        # vLLM/SGLang common style for Qwen thinking switch.
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: false
+
+    - name: "qwen36-think"
+      path: "/qwen36-think"
+      model: "qwen3.6-thinking"
+      upstream_model: "qwen3.6-27b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen36-a", "qwen36-b"]
+      request_patches:
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: true
+
+    - name: "qwen35-direct"
+      path: "/qwen35-direct"
+      model: "qwen3.5-direct"
+      upstream_model: "qwen3.5-32b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen35-a"]
+      request_patches:
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: false
+
+    - name: "qwen35-think"
+      path: "/qwen35-think"
+      model: "qwen3.5-thinking"
+      upstream_model: "qwen3.5-32b-w8a8"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["qwen35-a"]
+      request_patches:
+        - op: set
+          path: "chat_template_kwargs.enable_thinking"
+          value: true
+
+    # Example for an upstream that expects a top-level enable_thinking instead.
+    # - name: "qwen36-direct-top-param"
+    #   path: "/qwen36-direct-top"
+    #   model: "qwen3.6-direct-top"
+    #   upstream_model: "qwen3.6-27b-w8a8"
+    #   upstream_path: "/v1/chat/completions"
+    #   endpoints: ["qwen36-a"]
+    #   request_patches:
+    #     - op: set
+    #       path: "enable_thinking"
+    #       value: false
+
+  endpoints:
+    # Qwen3.6 endpoint A. weight=2 means it gets about twice the traffic of qwen36-b
+    # when strategy=weighted_round_robin or weighted_random.
+    - name: "qwen36-a"
+      base_url: "http://qwen36-a.aict.svc.cluster.local:8000"
+      api_key: ""        # e.g. sk-upstream-qwen36-a; keep empty if upstream does not need auth
+      weight: 2
+      timeout: "10m"
+      models: ["qwen3.6", "qwen3.6-direct", "qwen3.6-thinking"]
+
+    - name: "qwen36-b"
+      base_url: "http://qwen36-b.aict.svc.cluster.local:8000"
+      api_key: ""
+      weight: 1
+      timeout: "10m"
+      models: ["qwen3.6", "qwen3.6-direct", "qwen3.6-thinking"]
+
+    - name: "qwen35-a"
+      base_url: "http://qwen35-a.aict.svc.cluster.local:8000"
+      api_key: ""
+      weight: 1
+      timeout: "10m"
+      models: ["qwen3.5", "qwen3.5-direct", "qwen3.5-thinking"]
+
+transform:
+  enabled: true
+  inject_think_tag: true
+  strip_reasoning_fields: true
+  parse_think_from_content: true
+  reorder_system_messages: true
+  reasoning_fields:
+    - reasoning_content
+    - reasoning
+YAML
 }
 
 parse_bool() {
@@ -425,6 +621,9 @@ case "${ACTION}" in
     confirm
     uninstall
     ok "Uninstall completed"
+    ;;
+  example-config|config-example|sample-config)
+    print_example_config
     ;;
   help|-h|--help)
     usage
