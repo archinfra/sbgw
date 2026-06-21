@@ -9,6 +9,11 @@ import (
 	"github.com/spf13/viper"
 )
 
+const (
+	RouteKindChat               = "chat"
+	RouteKindAudioTranscription = "audio_transcription"
+)
+
 type Config struct {
 	Server    ServerConfig    `mapstructure:"server"`
 	Log       LogConfig       `mapstructure:"log"`
@@ -67,11 +72,17 @@ type UpstreamEndpointConfig struct {
 }
 
 // RouteConfig exposes a gateway-local subpath as a logical model variant.
-// Example: /qwen36-think/v1/chat/completions can route to upstream model
-// qwen3.6-27b-w8a8 and inject framework-specific thinking parameters.
+//
+// kind defaults to chat. Set kind=audio_transcription for OpenAI-compatible
+// /v1/audio/transcriptions routes, e.g. MiMo ASR.
+// adapter is a human-readable compatibility label used in logs and docs. The
+// gateway stays conservative and still uses explicit request_patches for actual
+// provider-specific request mutation.
 type RouteConfig struct {
 	Name           string               `mapstructure:"name"`
 	Path           string               `mapstructure:"path"`
+	Kind           string               `mapstructure:"kind"`
+	Adapter        string               `mapstructure:"adapter"`
 	Model          string               `mapstructure:"model"`
 	UpstreamModel  string               `mapstructure:"upstream_model"`
 	UpstreamPath   string               `mapstructure:"upstream_path"`
@@ -186,6 +197,8 @@ func normalizeUpstreamDefaults(cfg *Config) {
 		r := &cfg.Upstream.Routes[i]
 		r.Name = strings.TrimSpace(r.Name)
 		r.Path = normalizeRoutePath(r.Path)
+		r.Kind = normalizeRouteKind(r.Kind)
+		r.Adapter = strings.TrimSpace(strings.ToLower(r.Adapter))
 		if r.Name == "" {
 			r.Name = strings.TrimPrefix(r.Path, "/")
 		}
@@ -193,7 +206,11 @@ func normalizeUpstreamDefaults(cfg *Config) {
 			r.Model = r.Name
 		}
 		if r.UpstreamPath == "" {
-			r.UpstreamPath = "/v1/chat/completions"
+			if r.Kind == RouteKindAudioTranscription {
+				r.UpstreamPath = "/v1/audio/transcriptions"
+			} else {
+				r.UpstreamPath = "/v1/chat/completions"
+			}
 		}
 		if !strings.HasPrefix(r.UpstreamPath, "/") {
 			r.UpstreamPath = "/" + r.UpstreamPath
@@ -216,6 +233,20 @@ func normalizeRoutePath(path string) string {
 		return ""
 	}
 	return "/" + path
+}
+
+func normalizeRouteKind(kind string) string {
+	kind = strings.TrimSpace(strings.ToLower(kind))
+	kind = strings.ReplaceAll(kind, "-", "_")
+	kind = strings.ReplaceAll(kind, ".", "_")
+	switch kind {
+	case "", RouteKindChat, "chat_completion", "chat_completions", "completion", "completions":
+		return RouteKindChat
+	case RouteKindAudioTranscription, "audio_transcriptions", "transcription", "transcriptions", "asr", "audio_asr":
+		return RouteKindAudioTranscription
+	default:
+		return kind
+	}
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -246,6 +277,11 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate upstream route path %q", r.Path)
 		}
 		seenRoutes[r.Path] = struct{}{}
+		switch r.Kind {
+		case RouteKindChat, RouteKindAudioTranscription:
+		default:
+			return fmt.Errorf("upstream route %q has unsupported kind %q", r.Name, r.Kind)
+		}
 		for _, epName := range r.Endpoints {
 			epName = strings.TrimSpace(epName)
 			if epName == "" {
