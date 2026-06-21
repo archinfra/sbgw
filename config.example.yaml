@@ -6,10 +6,14 @@
 # 推荐接入方式：
 #   http://<gateway>:30088/qwen36-direct/v1/chat/completions
 #   http://<gateway>:30088/qwen36-think/v1/chat/completions
+#   http://<gateway>:30088/deepseek-v4/v1/chat/completions
+#   http://<gateway>:30088/mimo-asr/v1/audio/transcriptions
 #
 # OpenAI SDK 可把 base_url 设置为：
 #   http://<gateway>:30088/qwen36-direct/v1
 #   http://<gateway>:30088/qwen36-think/v1
+#   http://<gateway>:30088/deepseek-v4/v1
+#   http://<gateway>:30088/mimo-asr/v1
 #
 # API key 分两层：
 #   1. auth.* 是调用网关的前端/用户 key。
@@ -56,17 +60,23 @@ upstream:
   # 负载策略：round_robin | weighted_round_robin | random | weighted_random | least_inflight
   strategy: "weighted_round_robin"
 
-  # 兼容 /v1/chat/completions：前端传逻辑模型名，网关改写成上游真实 model。
+  # 兼容 /v1/chat/completions 和 /v1/audio/transcriptions：
+  # 前端传逻辑模型名，网关改写成上游真实 model。
   model_map:
     qwen3.6: "qwen3.6-27b-w8a8"
     qwen3.5: "qwen3.5-32b-w8a8"
+    deepseek-v4: "deepseek-v4-flash"
+    mimo-asr: "mimo-audio-asr"
 
-  # 一个公网端口 + 多个 route 前缀：推荐 /{path}/v1/chat/completions，兼容 /v1/{path}/chat/completions。
-  # 这里把同一个真实模型拆成“思考”和“非思考”两个网关模型；不同框架通过 request_patches 适配。
+  # 一个公网端口 + 多个 route 前缀：推荐 /{path}/v1/...
+  # kind 默认是 chat；MiMo ASR 这类语音识别入口使用 kind: audio_transcription。
+  # adapter 是兼容性标签，用于日志/文档归类；真正的参数变换仍然用 request_patches 明确控制。
   routes:
     # vLLM/SGLang 一类上游：通常识别 chat_template_kwargs.enable_thinking。
     - name: "qwen36-think"
       path: "/qwen36-think"
+      kind: "chat"
+      adapter: "qwen"
       model: "qwen3.6-thinking"
       upstream_model: "qwen3.6-27b-w8a8"
       upstream_path: "/v1/chat/completions"
@@ -78,6 +88,8 @@ upstream:
 
     - name: "qwen36-direct"
       path: "/qwen36-direct"
+      kind: "chat"
+      adapter: "qwen"
       model: "qwen3.6-direct"
       upstream_model: "qwen3.6-27b-w8a8"
       upstream_path: "/v1/chat/completions"
@@ -89,6 +101,8 @@ upstream:
 
     - name: "qwen35-think"
       path: "/qwen35-think"
+      kind: "chat"
+      adapter: "qwen"
       model: "qwen3.5-thinking"
       upstream_model: "qwen3.5-32b-w8a8"
       upstream_path: "/v1/chat/completions"
@@ -100,6 +114,8 @@ upstream:
 
     - name: "qwen35-direct"
       path: "/qwen35-direct"
+      kind: "chat"
+      adapter: "qwen"
       model: "qwen3.5-direct"
       upstream_model: "qwen3.5-32b-w8a8"
       upstream_path: "/v1/chat/completions"
@@ -109,9 +125,42 @@ upstream:
           path: "chat_template_kwargs.enable_thinking"
           value: false
 
+    # DeepSeek V4 / V4 Flash 示例：保守透传 OpenAI-compatible chat。
+    # 网关会统一兼容 reasoning/reasoning_content 返回，并可删除 Qwen 专属参数，避免污染 DeepSeek 请求。
+    - name: "deepseek-v4"
+      path: "/deepseek-v4"
+      kind: "chat"
+      adapter: "deepseek-v4"
+      model: "deepseek-v4"
+      upstream_model: "deepseek-v4-flash"
+      upstream_path: "/v1/chat/completions"
+      endpoints: ["deepseek-v4-a"]
+      request_patches:
+        - op: delete
+          path: "chat_template_kwargs.enable_thinking"
+        - op: delete
+          path: "enable_thinking"
+
+    # MiMo ASR 示例：OpenAI-compatible multipart/form-data 音频转写。
+    # 客户端请求 /mimo-asr/v1/audio/transcriptions，网关会把 multipart 里的 model 改写为 upstream_model。
+    - name: "mimo-asr"
+      path: "/mimo-asr"
+      kind: "audio_transcription"
+      adapter: "mimo-asr"
+      model: "mimo-asr"
+      upstream_model: "mimo-audio-asr"
+      upstream_path: "/v1/audio/transcriptions"
+      endpoints: ["mimo-asr-a"]
+      request_patches:
+        - op: set
+          path: "response_format"
+          value: "json"
+
     # 阿里云 DashScope/Model Studio 兼容接口示例：通常识别顶层 enable_thinking。
     # - name: "qwen35-direct-dashscope"
     #   path: "/qwen35-direct"
+    #   kind: "chat"
+    #   adapter: "dashscope"
     #   model: "qwen3.5-direct"
     #   upstream_model: "qwen3.5-plus"
     #   endpoints: ["dashscope"]
@@ -141,6 +190,18 @@ upstream:
       weight: 1
       timeout: "10m"
       models: ["qwen3.5", "qwen3.5-thinking", "qwen3.5-direct"]
+    - name: "deepseek-v4-a"
+      base_url: "http://127.0.0.1:18492"
+      api_key: ""
+      weight: 1
+      timeout: "10m"
+      models: ["deepseek-v4"]
+    - name: "mimo-asr-a"
+      base_url: "http://127.0.0.1:18493"
+      api_key: ""
+      weight: 1
+      timeout: "30m"
+      models: ["mimo-asr"]
 
 transform:
   enabled: true
