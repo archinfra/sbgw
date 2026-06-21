@@ -20,6 +20,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var _ = auth.ContextClientID
+
 func routeAllowsChat(kind string) bool {
 	return kind == "" || kind == config.RouteKindChat
 }
