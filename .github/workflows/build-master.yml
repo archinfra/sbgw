@@ -1,0 +1,86 @@
+name: build-master
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+      - run: go mod tidy
+      - run: go test ./...
+      - run: go build -o /tmp/sbgw ./cmd/sbgw
+
+  run-packages:
+    name: Build offline run package (${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ amd64, arm64 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build .run package from local Dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="sha-${GITHUB_SHA::7}"
+          fi
+          export COMMIT="${GITHUB_SHA::7}"
+          export DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          bash build.sh --arch "${{ matrix.arch }}" --version "${VERSION}"
+          ls -lh dist/
+          run_file="$(ls dist/*.run | head -n 1)"
+          min_size=$((5 * 1024 * 1024))
+          actual_size=$(stat -c '%s' "$run_file")
+          if (( actual_size < min_size )); then
+            echo "[ERROR] .run package is too small (${actual_size} bytes). It probably does not contain image tar payload."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbgw-run-${{ matrix.arch }}
+          path: |
+            dist/*.run
+            dist/*.sha256
+
+  github-release:
+    name: Upload run packages to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: run-packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sbgw-run-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.run
+            dist/*.sha256
