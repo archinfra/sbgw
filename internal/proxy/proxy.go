@@ -300,37 +300,44 @@ func (p *ChatProxy) handleStream(c *gin.Context, body io.Reader, reqID string, s
 	c.Writer.Header().Set("Connection", "keep-alive")
 	flusher, _ := c.Writer.(http.Flusher)
 	tracker := transform.NewStreamTracker()
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	reader := bufio.NewReader(body)
 	chunks := 0
 	var totalTokens int64
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			_, _ = c.Writer.Write(append(line, '\n'))
-			if flusher != nil {
-				flusher.Flush()
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimRight(line, "\r\n")
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				_, _ = c.Writer.Write(line)
+				_, _ = c.Writer.Write([]byte("\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			} else {
+				data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+				outData, transformErr := transform.NormalizeSSEData(data, p.transform, tracker)
+				if transformErr != nil {
+					outData = data
+				}
+				if n := transform.ExtractTotalTokens(outData); n > 0 {
+					totalTokens = n
+				}
+				_, _ = c.Writer.Write([]byte("data: "))
+				_, _ = c.Writer.Write(outData)
+				_, _ = c.Writer.Write([]byte("\n\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				chunks++
 			}
+		}
+		if err == nil {
 			continue
 		}
-		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		outData, err := transform.NormalizeSSEData(data, p.transform, tracker)
-		if err != nil {
-			outData = data
+		if err != io.EOF {
+			p.log.Error("stream read failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
 		}
-		if n := transform.ExtractTotalTokens(outData); n > 0 {
-			totalTokens = n
-		}
-		_, _ = c.Writer.Write([]byte("data: "))
-		_, _ = c.Writer.Write(outData)
-		_, _ = c.Writer.Write([]byte("\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-		chunks++
-	}
-	if err := scanner.Err(); err != nil {
-		p.log.Error("stream read failed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.Error(err))
+		break
 	}
 	p.recordUsage(c, totalTokens, reqID, model)
 	p.log.Info("stream completed", zap.String("request_id", reqID), zap.String("upstream", ep.cfg.Name), zap.String("model", model), zap.Int("chunks", chunks), zap.Int64("total_tokens", totalTokens), zap.Duration("latency", time.Since(start)), zap.Int64("inflight", ep.currentInflight()))
