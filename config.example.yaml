@@ -53,7 +53,7 @@ auth:
 upstream:
   # 兼容旧配置：没有 endpoints 时自动转换成 default endpoint。
   base_url: "http://127.0.0.1:18489"
-  timeout: "10m"
+  timeout: "30m"
   api_key: ""
   forward_client_authorization: false
 
@@ -176,25 +176,25 @@ upstream:
       base_url: "http://127.0.0.1:18489"
       api_key: ""
       weight: 2
-      timeout: "10m"
+      timeout: "30m"
       models: ["qwen3.6", "qwen3.6-thinking", "qwen3.6-direct"]
     - name: "qwen36-b"
       base_url: "http://127.0.0.1:18490"
       api_key: ""
       weight: 1
-      timeout: "10m"
+      timeout: "30m"
       models: ["qwen3.6", "qwen3.6-thinking", "qwen3.6-direct"]
     - name: "qwen35-a"
       base_url: "http://127.0.0.1:18491"
       api_key: ""
       weight: 1
-      timeout: "10m"
+      timeout: "30m"
       models: ["qwen3.5", "qwen3.5-thinking", "qwen3.5-direct"]
     - name: "deepseek-v4-a"
       base_url: "http://127.0.0.1:18492"
       api_key: ""
       weight: 1
-      timeout: "10m"
+      timeout: "30m"
       models: ["deepseek-v4"]
     - name: "mimo-asr-a"
       base_url: "http://127.0.0.1:18493"
