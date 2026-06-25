@@ -36,7 +36,7 @@ data:
 
     upstream:
       base_url: "{{UPSTREAM_BASE_URL}}"
-      timeout: "10m"
+      timeout: "30m"
       api_key: "{{UPSTREAM_API_KEY}}"
       forward_client_authorization: {{UPSTREAM_FORWARD_CLIENT_AUTHORIZATION}}
       strategy: "{{UPSTREAM_STRATEGY}}"
@@ -89,7 +89,7 @@ data:
           base_url: "{{UPSTREAM_BASE_URL}}"
           api_key: "{{UPSTREAM_API_KEY}}"
           weight: 1
-          timeout: "10m"
+          timeout: "30m"
           models: []
 
     transform:
