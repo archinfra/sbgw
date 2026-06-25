@@ -149,7 +149,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.enabled", false)
 	v.SetDefault("auth.header", "Authorization")
 	v.SetDefault("upstream.base_url", "http://127.0.0.1:18489")
-	v.SetDefault("upstream.timeout", "10m")
+	v.SetDefault("upstream.timeout", "30m")
 	v.SetDefault("upstream.forward_client_authorization", false)
 	v.SetDefault("upstream.strategy", "weighted_round_robin")
 	v.SetDefault("transform.enabled", true)
