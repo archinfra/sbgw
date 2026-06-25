@@ -79,7 +79,7 @@ auth:
 ```yaml
 upstream:
   base_url: "http://127.0.0.1:18489"
-  timeout: "10m"
+  timeout: "30m"
   api_key: ""
   forward_client_authorization: false
   strategy: "weighted_round_robin"
@@ -107,7 +107,7 @@ endpoints:
     base_url: "http://127.0.0.1:18489"
     api_key: ""
     weight: 2
-    timeout: "10m"
+    timeout: "30m"
     models: ["qwen3.6", "qwen3.6-thinking", "qwen3.6-direct"]
 ```
 
