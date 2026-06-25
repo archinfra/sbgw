@@ -71,7 +71,7 @@ func (p *ChatProxy) HandleModels(c *gin.Context) {
 		if id == "" {
 			id = route.Name
 		}
-		c.JSON(http.StatusOK, gin.H{"object": "list", "data": []gin.H{{"id": id, "object": "model", "owned_by": "sbgw", "route": route.Name}}})
+		c.JSON(http.StatusOK, gin.H{"object": "list", "data": []gin.H{{"id": id, "object": "model", "owned_by": "sbgw", "route": route.Name, "kind": route.Kind, "adapter": route.Adapter}}})
 		return
 	}
 
@@ -116,6 +116,10 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": routeErr}})
 		return
 	}
+	if routeOK && !routeAllowsChat(route.Kind) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "route does not support chat completions", "route": route.Name, "kind": route.Kind}})
+		return
+	}
 
 	logicalModel := reqInfo.Model
 	if routeOK && route.Model != "" {
@@ -140,7 +144,7 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		}
 		body = patched
 		if result.Applied > 0 {
-			p.log.Info("route request patches applied", zap.String("request_id", reqID), zap.String("route", route.Name), zap.String("route_path", route.Path), zap.Int("patches", result.Applied))
+			p.log.Info("route request patches applied", zap.String("request_id", reqID), zap.String("route", route.Name), zap.String("route_path", route.Path), zap.String("route_kind", route.Kind), zap.String("adapter", route.Adapter), zap.Int("patches", result.Applied))
 		}
 	}
 
@@ -167,7 +171,7 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 	defer ep.end()
 
 	if p.cfg.Log.LogBody {
-		p.log.Info("gateway request body", zap.String("request_id", reqID), zap.String("client", c.GetString(auth.ContextClientName)), zap.String("route", route.Name), zap.String("model", logicalModel), zap.String("upstream_model", upstreamModel), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
+		p.log.Info("gateway request body", zap.String("request_id", reqID), zap.String("client", c.GetString(auth.ContextClientName)), zap.String("route", route.Name), zap.String("route_kind", route.Kind), zap.String("adapter", route.Adapter), zap.String("model", logicalModel), zap.String("upstream_model", upstreamModel), zap.ByteString("body", limitBody(body, p.cfg.Log.MaxBodySize)))
 	}
 	if p.cfg.Log.LogHeaders {
 		p.log.Info("gateway request headers", zap.String("request_id", reqID), zap.Any("headers", redactHeaders(c.Request.Header, p.cfg.Log.RedactHeaders)))
@@ -210,6 +214,8 @@ func (p *ChatProxy) HandleChatCompletions(c *gin.Context) {
 		zap.String("strategy", p.cfg.Upstream.Strategy),
 		zap.String("route", route.Name),
 		zap.String("route_path", route.Path),
+		zap.String("route_kind", route.Kind),
+		zap.String("adapter", route.Adapter),
 		zap.String("upstream", ep.cfg.Name),
 		zap.String("upstream_base_url", ep.cfg.BaseURL),
 		zap.String("upstream_path", upstreamPath),

@@ -58,19 +58,24 @@ func main() {
 	v1.GET("/models", chatProxy.HandleModels)
 	v1.GET("/usage", chatProxy.HandleUsage)
 	v1.Any("/chat/completions", chatProxy.HandleChatCompletions)
+	v1.Any("/audio/transcriptions", chatProxy.HandleAudioTranscriptions)
 	// Backward compatible route form kept for existing clients:
 	// /v1/{route}/chat/completions, e.g. /v1/qwen36-think/chat/completions.
+	// /v1/{route}/audio/transcriptions, e.g. /v1/mimo-asr/audio/transcriptions.
 	v1.Any("/:route/chat/completions", chatProxy.HandleChatCompletions)
+	v1.Any("/:route/audio/transcriptions", chatProxy.HandleAudioTranscriptions)
 
 	// Recommended route form for OpenAI-compatible base URLs:
 	// /{route}/v1/chat/completions, e.g. /qwen36-think/v1/chat/completions.
+	// /{route}/v1/audio/transcriptions, e.g. /mimo-asr/v1/audio/transcriptions.
 	// With this shape, clients can set base_url=http://host:port/qwen36-think/v1
-	// and still use the standard /chat/completions suffix.
+	// and still use the standard /chat/completions or /audio/transcriptions suffix.
 	routeV1 := r.Group("/:route/v1")
 	routeV1.Use(auth.Middleware(tokenStore, log))
 	routeV1.GET("/models", chatProxy.HandleModels)
 	routeV1.GET("/usage", chatProxy.HandleUsage)
 	routeV1.Any("/chat/completions", chatProxy.HandleChatCompletions)
+	routeV1.Any("/audio/transcriptions", chatProxy.HandleAudioTranscriptions)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
