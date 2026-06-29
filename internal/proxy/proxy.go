@@ -349,7 +349,7 @@ func (p *ChatProxy) recordUsage(c *gin.Context, tokens int64, reqID string, mode
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		lk := strings.ToLower(k)
-		if lk == "host" || lk == "content-length" || lk == "connection" || lk == "keep-alive" || lk == "proxy-authenticate" || lk == "proxy-authorization" || lk == "te" || lk == "trailer" || lk == "transfer-encoding" || lk == "upgrade" {
+		if lk == "host" || lk == "content-length" || lk == "content-encoding" || lk == "content-md5" || lk == "digest" || lk == "connection" || lk == "keep-alive" || lk == "proxy-authenticate" || lk == "proxy-authorization" || lk == "te" || lk == "trailer" || lk == "transfer-encoding" || lk == "upgrade" {
 			continue
 		}
 		dst.Del(k)
